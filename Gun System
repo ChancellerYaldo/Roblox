@@ -1,0 +1,1194 @@
+
+
+local PFS = game:GetService("PathfindingService")
+local SoundService = game:GetService("SoundService")
+local CAS = game:GetService("ContextActionService")
+local RunService = game:GetService("RunService")
+local TweenService = game:GetService("TweenService")
+local Debris = game:GetService("Debris")
+local UIS = game:GetService("UserInputService")
+
+local Ragdoll = require(game.ReplicatedStorage.Ragdoll)
+local Loot = require(game.ReplicatedStorage.Loot)
+
+local MaterialHealths = {
+	Player = 33,
+	Metal = 101,
+	Brick = 101,
+	Concrete = 101,
+	Wood = 50,
+	Plastic = 40,
+	SmoothPlastic = 40,
+	Neon = 30,
+	Fabric = 20,
+	Glass = 10,
+	Sand = 10,
+	Mud = 10,
+}
+
+local function GetHealth(CurrentHealth, MaterialName)
+	return CurrentHealth - (MaterialHealths[MaterialName] or 75)
+end
+
+local MouseDistance = 1000000000
+
+local function HeadCheck(Hit)
+	--print(Hit.Name)
+	--if Hit.Parent:IsA("Accessory") then
+		--print(Hit.AccessoryWeld.Part1, Hit.Name)
+	--end
+	return (Hit.Parent:IsA("Accessory") and Hit.AccessoryWeld.Part1 == Hit:FindFirstAncestorOfClass("Model").Head) or Hit == Hit:FindFirstAncestorOfClass("Model").Head
+end
+
+local function GetDamage(Hit, Tool, Configuration)
+	--local BaseDamage = Configuration.Damage.Body.Value
+
+	--if (Hit.Parent:IsA("Accessory") and Hit.Parent) or Hit.Name == "Head" then
+	--	BaseDamage = Configuration.Damage.Head.Value
+	--end
+	--if Configuration.ShootTypes.Shotgun.Value then
+	--	local Distance = (Hit.Position - Tool.Handle.FirePoint.WorldPosition).Magnitude
+	--	local Multiplier = 4
+	--	BaseDamage = math.floor(math.pow(math.pow(BaseDamage, Multiplier + 5) / math.pow(Distance, Multiplier), 1/(Multiplier + 2)))
+	--end
+		
+
+	local Damage = Configuration.BodyDamage --BaseDamage
+	
+	if HeadCheck(Hit) then
+		Damage = Configuration.HeadDamage
+	end
+	
+	if Configuration.ShootType == "Shotgun" then
+		local MaxRange = 40 --this number indicates the maximum range within the base damage shouldn't change
+		local Distance = (Hit.Position - Tool.Handle.FirePoint.WorldPosition).Magnitude
+		Damage = math.floor(math.clamp(Damage / math.clamp(Distance / MaxRange, 1, 2), 1, Damage))
+	end
+
+	return Damage
+	
+end
+
+local function HasProperty(Object, PropertyName)
+	local Success, Result = pcall(function()
+		return Object[PropertyName]
+	end)
+	
+	return Success and true
+end
+
+local function CheckForLowAmmo(Current, OutOf)
+	local Player = not RunService:IsServer() and game.Players.LocalPlayer
+	if Player then
+		local LowAmmo = Player.PlayerGui.Ammo.LowAmmo
+		if Current / OutOf <= .25 then
+			TweenService:Create(LowAmmo.ImageLabel, TweenInfo.new(.1), {ImageTransparency = 0}):Play()
+			TweenService:Create(LowAmmo.TextLabel, TweenInfo.new(.1), {TextTransparency = 0}):Play()
+			LowAmmo.ImageLabel.ImageTransparency = 0
+			LowAmmo.TextLabel.TextTransparency = 0
+			Player.PlayerGui.Ammo.LowAmmo.TextLabel.Text = Current		
+			LowAmmo.Visible = true
+			local OriginalSize = UDim2.fromScale(1, 1)
+			LowAmmo.TextLabel.Size = UDim2.fromScale(OriginalSize.X.Scale * 1.5, OriginalSize.Y.Scale * 1.5)
+			TweenService:Create(LowAmmo.TextLabel, TweenInfo.new(.1), {Size = OriginalSize}):Play()
+			local TI = TweenInfo.new(1, Enum.EasingStyle.Linear, Enum.EasingDirection.Out, 0, false, 1)
+			TweenService:Create(LowAmmo.ImageLabel, TI, {ImageTransparency = 1}):Play()
+			TweenService:Create(LowAmmo.TextLabel, TI, {TextTransparency = 1}):Play()
+		end
+	end
+end
+
+local function IsAlive(Humanoid)
+	local IsPlayer = game.Players:GetPlayerFromCharacter(Humanoid.Parent)
+	local Health = (IsPlayer or not Humanoid.Parent:GetAttribute("Health")) and Humanoid.Health or Humanoid.Parent:GetAttribute("Health")
+	--print(IsPlayer, Humanoid.Health, Humanoid.Parent:GetAttribute("Health"))
+	return Health > 0 and Health
+end
+
+local Gun = {}
+
+Gun.Shooting = false
+
+Gun.Aiming = false
+Gun.Recoil = Instance.new("Vector3Value")
+
+Gun.ShootShakeOffset = Instance.new("Vector3Value")
+
+Gun.Ammo = {
+	Light = 200,
+	Medium = 300,
+}
+
+Gun.CurrentBullets = 0
+
+function Gun.GiveAmmo(Type, ToAdd)
+	Gun.Ammo[Type] += ToAdd
+end
+
+local function ClientSound(NPC, Sound, State)
+	if not NPC then
+		if State then
+			Sound:Play()
+		else
+			Sound:Stop()
+		end
+	end
+end
+
+local function Effects(Tool, NPC, Parameters)
+	if not NPC then
+		Tool.GunStuff.Events.Other:FireServer(unpack(Parameters))
+	else
+		Gun.Other(NPC, unpack(Parameters))
+	end
+end
+
+local function ClientEffects(NPC, GunEffects, Type, Parameters)
+	if not NPC then
+		GunEffects[Type](unpack(Parameters))
+	end
+end
+
+function Gun.Client(Tool, NPC)
+	local Player = not NPC and game.Players.LocalPlayer
+	local Character = NPC or Player.Character
+	
+	local CustomCamera = not NPC and require(Character.Client.CustomCamera)
+	local GunEffects = require(script.GunEffects)
+	local CheckPlayerDistance = require(game.ReplicatedStorage.GunFramework.Modules.CheckPlayerDistance)
+	local CrosshairModule = not NPC and require(script.Parent:WaitForChild("Crosshair"))
+	--local BreakGlass2 = require(game.ReplicatedStorage.FractureGlass)
+	--local BreakGlass = require(game.ReplicatedStorage.GunFramework.Modules.BreakGlass)
+	
+	local StartSize = UDim2.fromScale(.051, .088)
+	local PeakSize = UDim2.fromScale(.051 * 2, .088 * 2) 
+	local MinSize = UDim2.fromScale(.051 * .75, .088 * .75) 
+	local MainFrame = nil
+	
+	local function Crosshair(BodyPart, Killed)
+		if not NPC then
+			coroutine.wrap(function()
+				if MainFrame then
+					MainFrame:Destroy()
+				end
+			
+				MainFrame = Player.PlayerGui:WaitForChild("Crosshair").Template:Clone()
+				MainFrame.Parent = Player.PlayerGui.Crosshair
+				
+				local function ChangeProperty(PropertyName, Value)
+					for i, v in pairs(MainFrame:GetChildren()) do
+						if v:IsA("Frame") then
+							v[PropertyName] = Value
+						end
+					end
+				end
+			
+				if Killed then
+					ChangeProperty("BackgroundColor3", Color3.fromRGB(163, 0, 0))
+				elseif HeadCheck(BodyPart) then
+					ChangeProperty("BackgroundColor3", Color3.fromRGB(182, 185, 4))
+				end
+				
+
+				MainFrame.Size = StartSize
+				MainFrame.Visible = true
+				TweenService:Create(MainFrame, TweenInfo.new(.08, Enum.EasingStyle.Sine), {Size = PeakSize}):Play()
+				TweenService:Create(MainFrame, TweenInfo.new(.08, Enum.EasingStyle.Sine), {Rotation = math.random(-10,10)}):Play()
+				task.wait(.08)
+				TweenService:Create(MainFrame, TweenInfo.new(.04, Enum.EasingStyle.Sine), {Size = MinSize}):Play()
+				task.wait(.5)
+
+				ChangeProperty("Transparency", 1)
+			end)()
+		end
+	end
+	
+	
+	
+	local Configuration = require(Tool.GunStuff:FindFirstChildWhichIsA("ModuleScript"))
+	
+	local Equipped = false
+	local Reloading = false
+	local PerMag = Configuration.PerMag
+	local GunAmmo = PerMag
+	Gun.CurrentBullets = GunAmmo
+
+	local Humanoid = Character:WaitForChild("Humanoid")
+	local HRP = Character:WaitForChild("HumanoidRootPart")
+	local Torso = Character:WaitForChild("Torso", 10000000)
+	local RightShoulder = Torso:WaitForChild("Right Shoulder", 10000000)
+	local OriginalRightShoulderCFrame = RightShoulder.C0
+	local LeftShoulder = Torso:WaitForChild("Left Shoulder", 100000)
+	local OriginalLeftShoulderCFrame = LeftShoulder.C0
+	local Camera = not NPC and workspace.CurrentCamera
+	if not Camera then
+		Camera = Instance.new("Part")
+		Camera.Size = Vector3.zero
+		Camera.Transparency = 1
+		Camera.Anchored = true
+		Camera.CanCollide = false
+		Camera.CanTouch = false
+		Camera.CanQuery = false
+		Camera.CFrame = Character.Head.CFrame
+		Camera.Parent = workspace
+	end
+	local ArmModel = not NPC and workspace:WaitForChild("ArmModel")	
+	local Animations = Tool.GunStuff.Animations
+	
+	local function Action(AnimName)
+		local NormalTrack
+		local ArmModelTrack
+		if Animations:FindFirstChild(AnimName) and Animations[AnimName].AnimationId ~= "" then
+			NormalTrack = Humanoid.Animator:LoadAnimation(Animations[AnimName])
+		end
+		if Animations:FindFirstChild("ArmModel" .. AnimName) and Animations["ArmModel" .. AnimName].AnimationId ~= "" and ArmModel then
+			ArmModelTrack = ArmModel.Humanoid.Animator:LoadAnimation(Animations["ArmModel" .. AnimName])
+		end
+
+		return NormalTrack, ArmModelTrack 
+	end
+
+	local EquipTrack, ArmModelEquipTrack = Action("Equip")
+	local UnequipTrack, ArmModelUnequipTrack = Action("Unequip")
+	local IdleTrack, ArmModelIdleTrack = Action("Idle")
+	local AimTrack, ArmModelAimTrack = Action("Aim")
+	local ShootTrack, ArmModelShootTrack = Action("Shoot")
+	local ReloadTrack, ArmModelReloadTrack = Action("Reload")
+	local HipFireShootTrack, ArmModelHipFireShootTrack = Action("HipFireShoot")
+	local InspectTrack, ArmModelInspectTrack = Action("Inspect")
+	local JumpTrack, ArmModelJumpTrack = Action("Jump")
+	local FallTrack, ArmModelFallTrack = Action("Fall")
+	local LandTrack, ArmModelLandTrack = Action("Land")
+	
+	if ArmModelIdleTrack then
+		ArmModelIdleTrack.Priority = Enum.AnimationPriority.Action
+	end
+	
+	if ArmModelAimTrack then
+		ArmModelAimTrack.Priority = Enum.AnimationPriority.Action2
+	end
+	
+	local function PlayAnimation(Track, Start)
+		if Track then
+			if Start then
+				if not Track.IsPlaying or not Track.Looped then
+					Track:Play()
+				end				
+			else
+				if Track.IsPlaying then
+					Track:Stop()
+				end				
+			end		
+			return true
+		else
+			return false
+		end
+	end
+	
+	ShootTrack.Looped = false
+	
+	local Parameters = RaycastParams.new()
+	Parameters.FilterDescendantsInstances = {Character}
+
+	local function GetMousePosition()
+		local Mouse2D = UIS:GetMouseLocation()
+		local ray = game.Workspace.CurrentCamera:ViewportPointToRay(Mouse2D.X, Mouse2D.Y)
+		local Result = workspace:Raycast(ray.Origin, ray.Direction * MouseDistance, Parameters)
+
+		if Result then
+			return Result.Position
+		else
+			return ray.Origin + ray.Direction * MouseDistance
+		end
+	end
+	
+	local AimDebounce = false
+	
+	local function Aim()
+		if not AimDebounce and not Reloading and IsAlive(Humanoid) then
+			
+			PlayAnimation(InspectTrack, false)
+			PlayAnimation(ArmModelInspectTrack, false)
+			
+			PlayAnimation(AimTrack, true)
+			PlayAnimation(ArmModelAimTrack, true)
+			--PlayAnimation(IdleTrack, false)
+			--PlayAnimation(ArmModelIdleTrack, false)
+			
+			if CustomCamera then
+				CustomCamera.Sensitivity(Configuration.AimSensitivityMultiplier)
+			end
+			
+			
+			ClientSound(NPC, Tool.Handle.Audios.Aim, true)
+			Gun.Aiming = true
+		
+			if not NPC and Configuration.ShootType == "Sniper" then
+				Player.PlayerGui.Sniper.Enabled = true
+			end
+		end
+	end
+	
+	local function Unaim()
+		PlayAnimation(AimTrack, false)
+		PlayAnimation(ArmModelAimTrack, false)
+		
+		if CustomCamera then
+			CustomCamera.Sensitivity()
+		end
+		
+		ClientSound(NPC, Tool.Handle.Audios.Unaim, true)
+		Gun.Aiming = false
+		
+		if not NPC and Configuration.ShootType == "Sniper" then
+			Player.PlayerGui.Sniper.Enabled = false
+		end
+	end
+	
+	local function AimState(_, State)
+		if State.Name == "Begin" then --Aim
+			Aim()
+		elseif State.Name == "End" then
+			Unaim()
+		end
+	end
+
+	local Debounce = false
+	local MadeClickSoundForNoAmmo = false	
+
+	local function Reload(ActionName, State)
+		if not ActionName or State.Name == "Begin" then
+			
+			if Gun.Ammo[Configuration.AmmoType] > 0 and Gun.CurrentBullets < PerMag and not Reloading and IsAlive(Humanoid) then
+
+				local ToAdd = PerMag - Gun.CurrentBullets
+
+				if ToAdd > Gun.Ammo[Configuration.AmmoType] then
+					ToAdd = Gun.Ammo[Configuration.AmmoType]
+				end
+				if ToAdd > 0 then
+					Reloading = true
+					
+					--print(Reloading)
+					ClientSound(NPC, Tool.Handle.Audios.Reload, true)
+					Effects(Tool, NPC, {"Sounds", nil, nil, nil, {Tool.Handle.Audios.Reload, true}})
+					
+					
+					PlayAnimation(ReloadTrack, true)
+					PlayAnimation(ArmModelReloadTrack, true)
+					
+					--print(Reloading)
+					if Gun.Aiming then
+						Unaim()
+					end
+					
+					--print(Reloading)
+					if not ReloadTrack then
+						task.wait(Configuration.ReloadTime)
+					else
+						ReloadTrack.Stopped:Wait()
+					end
+					--print(Reloading)
+					
+					if Reloading then --this is so if reloading has not been set to false when unequipped, then it will run
+						Gun.CurrentBullets += ToAdd
+						Gun.Ammo[Configuration.AmmoType] -= ToAdd
+
+						CheckForLowAmmo(Gun.CurrentBullets, PerMag)
+						
+						Reloading = false
+						
+						if UIS:IsMouseButtonPressed(Enum.UserInputType.MouseButton2) then
+							Aim()
+						end
+						
+					end
+				end
+			end
+		end
+	end
+	
+	local function FireRay(Origin, Direction, NewParameters, BulletHealth)
+		BulletHealth = BulletHealth or 100
+		Direction = Direction or Camera.CFrame.LookVector	
+		local RayOrigin = Origin or Camera.CFrame
+		local TrailOrigin = Origin or Tool.Handle.FirePoint.WorldCFrame
+		
+		local Result = workspace:Raycast(RayOrigin.Position, Direction * 1000, NewParameters or Parameters)
+		
+		local EndPosition = Result and Result.Position or RayOrigin.Position + Direction * 1000
+		
+	
+		
+		ClientEffects(NPC, GunEffects, "Trail", {TrailOrigin, EndPosition})
+		Effects(Tool, NPC, {"Trail", {TrailOrigin, EndPosition}})
+			
+		if Result then
+			local Distance = (TrailOrigin.Position - Result.Position).Magnitude
+
+			local Hit = Result.Instance		
+			local OtherCharacter = Hit:FindFirstAncestorWhichIsA("Model")
+			local IsCharacter = false
+			
+			if OtherCharacter then					
+				local OtherHumanoid = OtherCharacter:FindFirstChildWhichIsA("Humanoid")
+				local OtherPlayer = game.Players:GetPlayerFromCharacter(OtherCharacter)
+				if OtherHumanoid then
+					IsCharacter = true
+					
+					local NPCConfig = NPC and require(NPC:FindFirstChildWhichIsA("ModuleScript"))
+					local NPCChanceCheck = not NPC or math.random() < NPCConfig.HitChance
+
+					if not OtherPlayer or not OtherPlayer.Team or (NPC or (not NPC and OtherPlayer.Team ~= Player.Team)) and NPCChanceCheck then				
+						local Sound = game.ReplicatedStorage.GunFramework.Sounds.Bodyshot	
+						local Color = Color3.fromRGB(255, 255, 255)
+
+						if HeadCheck(Hit) then
+							Sound = game.ReplicatedStorage.GunFramework.Sounds.Headshot	
+							Color = Color3.fromRGB(255, 255, 0)
+						end
+						local BaseDamage = math.ceil(GetDamage(Hit, Tool, Configuration) * (BulletHealth/100))
+						if BaseDamage > 0 then
+							
+							local NewParams = RaycastParams.new()
+							NewParams.FilterDescendantsInstances = {Character, OtherCharacter}
+
+							FireRay(CFrame.new(Result.Position), nil, NewParams, GetHealth(BulletHealth, "Player"))
+							
+							if not NPC then
+								Tool.GunStuff.Events.Damage:FireServer(OtherHumanoid, Hit)
+							else
+								Gun.Damage(NPC, OtherHumanoid, Hit, Tool)
+							end
+							
+							if not NPC and OtherCharacter:FindFirstChild("HumanoidRootPart") and IsAlive(OtherHumanoid) then
+								local OtherHRP = OtherCharacter.HumanoidRootPart
+								local Gui = OtherHRP:FindFirstChild("DamageNumbers")
+								if not Gui then
+									Gui = game.ReplicatedStorage.GunFramework.DamageNumbers:Clone()
+									Gui.Adornee = OtherHRP						
+									Gui.TextLabel.Text = BaseDamage			
+									Gui.Parent = OtherHRP
+									Gui:SetAttribute("Hits", 0)
+								else										
+									Gui:SetAttribute("Hits", Gui:GetAttribute("Hits") + 1)
+									Gui.TextLabel.Text = tonumber(Gui.TextLabel.Text) + BaseDamage		
+								end
+
+								local HRPAngle = HRP.CFrame - HRP.Position
+								local HRPCFrameTurned = CFrame.new(OtherHRP.Position) * HRPAngle
+								local a = HRPCFrameTurned:ToWorldSpace(CFrame.new(2, 3, 0))
+								Gui.StudsOffsetWorldSpace = (OtherHRP.CFrame:ToObjectSpace(a)).Position
+
+								Gui.TextLabel.TextColor3 = Color
+								local Size = math.clamp(Distance/20, 1.5, 30)
+								Gui.Size = UDim2.fromScale(Size, Size)
+								TweenService:Create(Gui, TweenInfo.new(.1, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, 0, true), {Size = UDim2.fromScale(Size * 1.33, Size * 1.25)}):Play()
+
+								coroutine.wrap(function()
+									local StartHits = Gui:GetAttribute("Hits")
+									task.wait(1)
+									if StartHits == Gui:GetAttribute("Hits") then
+										Gui.Name = "Dead"
+										TweenService:Create(Gui.TextLabel, TweenInfo.new(.25, Enum.EasingStyle.Linear), {TextTransparency = 1}):Play()
+										task.wait(.5)
+										Gui:Destroy()
+									end
+								end)()
+								local Health = IsAlive(OtherHumanoid)
+								
+								--print(Health, BaseDamage)
+								Crosshair(Hit, Health <= BaseDamage) 
+								--damage is slightly delayed so they technically 
+								--wont be dead at the time this check is in place, so we need to subtract the health 
+								--which is going to be taken from them to see if they would be dead
+
+								Effects(Tool, NPC, {"Sounds", nil, nil, nil, {Tool.Handle.Audios.NoAmmo, true}})	
+								ClientSound(NPC, Sound, true)
+							end
+							
+							ClientEffects(NPC, GunEffects, "BloodSplat", {Character, OtherCharacter, Result.Position})
+							Effects(Tool, NPC, {"BloodSplat", nil, nil, nil, nil, {Character, OtherCharacter, Result.Position}})
+						end
+					end
+				end
+			end
+
+			if not IsCharacter then	
+				local Hole = game.ReplicatedStorage.GunFramework.Parts.BulletMark
+				
+				local MaterialHealth = MaterialHealths[Result.Instance.Material.Name]
+				if not Hit:GetAttribute("NoPenetration") and (not MaterialHealth or BulletHealth >= MaterialHealth) then
+					Hole = game.ReplicatedStorage.GunFramework.Parts.SoftWallHole
+					local NewParams = RaycastParams.new()
+					NewParams.FilterDescendantsInstances = {Result.Instance, Character}
+					FireRay(CFrame.new(Result.Position), Direction, NewParams, GetHealth(BulletHealth, Result.Instance.Material.Name))
+				end
+				
+				local HoleCFrame = CFrame.new(Result.Position, Result.Position + Result.Normal) * (Hole:GetAttribute("CFrameAdjustment") or CFrame.new(0, 0, 0))
+				ClientEffects(NPC, GunEffects, "BulletHole", {Hole, Hit, HoleCFrame})
+				Effects(Tool, NPC, {"BulletHole", nil, nil, {Hole, Hit, CFrame.new(Result.Position, Result.Position + Result.Normal)}})
+			end	
+		end
+	end
+	
+	
+	local function Fire()
+		if (not Debounce or Configuration.ShootType == "Shotgun") and not Reloading and IsAlive(Humanoid) then
+			
+			Gun.Shooting = true
+			Debounce = true
+			
+			if Gun.CurrentBullets > 0 then
+				
+				Parameters.FilterDescendantsInstances = {Character}
+				local EndPoint = GetMousePosition()
+		
+				local Min
+				local Max
+				
+				if NPC then
+					local DirectionCFrame = CFrame.new(Vector3.new(), Camera.CFrame.LookVector)
+					
+					local NPCConfig = require(NPC:FindFirstChildWhichIsA("ModuleScript"))
+					Min = NPCConfig.MinBloom
+					Max = NPCConfig.MaxBloom
+
+					if Gun.Aiming and Configuration.ShootType == "Shotgun" then
+						--Min =  Configuration.AimMinSpread.Value
+						--Max = Configuration.AimMaxSpread.Value
+					end
+				else
+					if Configuration.ShootType == "Shotgun" then
+						--Min = Configuration.MinSpread.Value
+						--Max = Configuration.MaxSpread.Value
+
+						--if Gun.Aiming then
+						--	Min = Configuration.AimMinSpread.Value
+						--	Max = Configuration.AimMaxSpread.Value
+						--end
+					elseif not NPC then
+						Min = 0
+						Max = (Player.PlayerGui.RealCrosshair.Template.Size.X.Scale * 5) * .95
+					end	
+				end
+				
+				for i = 1, Configuration.BulletsPerShot do	
+					local DirectionCFrame = CFrame.new(Vector3.new(), Camera.CFrame.LookVector)
+					local SpreadDirection = CFrame.fromOrientation(0, 0, math.rad(math.random(0, 360)))
+					local Spread = math.random(Min * 10, Max * 10)/10 
+					--Spread *= .2
+					local SpreadAngle = CFrame.fromOrientation(math.rad(Spread), 0, 0)
+					local Direction = (DirectionCFrame * SpreadDirection * SpreadAngle).LookVector
+					FireRay(nil, Direction)	
+				end
+				
+				local BloomStrength
+				if Gun.Aiming then
+					BloomStrength = Configuration.AimSpreadStrength
+				else
+					BloomStrength = Configuration.HipfireSpreadStrength
+				end
+				
+				if CrosshairModule then
+					CrosshairModule.CrosshairDistance(BloomStrength)
+				end
+
+				PlayAnimation(InspectTrack, false)
+				PlayAnimation(ArmModelInspectTrack, false)
+				
+				if Gun.Aiming then
+					PlayAnimation(ShootTrack, true)
+					
+					if not PlayAnimation(ArmModelShootTrack, true) then
+						PlayAnimation(ArmModelHipFireShootTrack, true)
+					end
+					
+				else
+					PlayAnimation(HipFireShootTrack, true)
+					PlayAnimation(ArmModelHipFireShootTrack, true)
+				end			
+				
+				ClientSound(NPC, Tool.Handle.Audios.Gunshot, true)	
+				Effects(Tool, NPC, {"Sounds", nil, nil, nil, {Tool.Handle.Audios.Gunshot, true}})
+				
+				ClientEffects(NPC, GunEffects, "Particles", {Tool, Configuration.BulletsPerShot})
+				Effects(Tool, NPC, {"Particles", nil, {Tool, Configuration.BulletsPerShot}})
+	
+				local ShakeTime = 0
+				
+				
+
+				--Recoil/Shake
+				local ShakeTime
+				local function ShootShake()
+					ShakeTime += .01
+					if ShakeTime <= .04 then
+						local currentTime = tick()
+						local BobbleX = math.cos(currentTime * 30) * 0.4 --speed, distance
+						local BobbleY = math.abs(math.sin(currentTime * 4)) * 0.3
+						local Bobble
+						Bobble = Vector3.new(BobbleX, BobbleY - .15, 0)
+						Gun.ShootShakeOffset.Value = Gun.ShootShakeOffset.Value:lerp(Bobble, 0.1)
+					else						
+						Gun.ShootShakeOffset.Value = Gun.ShootShakeOffset.Value:lerp(Vector3.zero, 0.1)
+						
+						if Gun.ShootShakeOffset.Value == Vector3.zero then
+							ShakeTime = 0
+							RunService:UnbindFromRenderStep("ShootShake")	
+						end					
+					end
+				end
+				
+				ShakeTime = 0 
+				RunService:UnbindFromRenderStep("ShootShake")	
+				RunService:BindToRenderStep("ShootShake", 1, ShootShake) 
+				
+				local HorizontalMin = Configuration.HorizontalMin
+				local HorizontalMax = Configuration.HorizontalMax
+				local Strength = Configuration.HorizontalStrength
+				
+				local VerticalMin = Configuration.VerticalMin
+				local VerticalMax = Configuration.VerticalMax
+				
+				local function BaseRecoil(Min, Max)
+					return math.random(Min * 10000, Max * 10000)/10000 
+				end
+				
+				local Direction = math.random() > Strength and 1 or -1 --Negative is to the right	
+				local HorizontalRecoil = BaseRecoil(HorizontalMin, HorizontalMax) * Direction
+				local VerticalRecoil = BaseRecoil(VerticalMin, VerticalMax)
+
+				Gun.Recoil.Value = Vector3.new(HorizontalRecoil, VerticalRecoil, 0)
+				
+				if Configuration.ShootType == "Sniper" then
+					coroutine.wrap(function()
+						AimDebounce = true
+						Unaim()
+						task.wait(Configuration.ShootDebounce)
+						AimDebounce = false
+						if UIS:IsMouseButtonPressed(Enum.UserInputType.MouseButton2) and Equipped then
+							Aim()
+						end
+					end)()
+				end
+				
+				Gun.CurrentBullets -= 1
+				CheckForLowAmmo(Gun.CurrentBullets, PerMag)
+			else
+				coroutine.wrap(function()
+
+					if not MadeClickSoundForNoAmmo or Configuration.ShootType ~= "Auto" then
+						MadeClickSoundForNoAmmo = true
+						ClientSound(NPC, Tool.Handle.Audios.NoAmmo, true)
+						Effects(Tool, NPC, {"Sounds", nil, nil, nil, {Tool.Handle.Audios.NoAmmo, true}})	
+						Reload()
+						MadeClickSoundForNoAmmo = false
+					end
+				end)()		
+			end
+			
+			if Configuration.ShootType ~= "Shotgun" then
+				task.wait(Configuration.ShootDebounce)
+			end		
+			
+			Debounce = false
+			Gun.Shooting = false			
+		end
+	end
+	
+	local BurstDebounce = false
+	local ShotgunDebounce = false
+	
+	local AlignPosition
+	local MaxTorque = 5
+	
+	local OriginalShootDebounce = Configuration.ShootDebounce
+	local MinigunStart = .18
+
+	if Configuration.ShootType == "Minigun" then
+		AlignPosition = game.ReplicatedStorage.AngularVelocity:Clone()
+		AlignPosition.Parent = Tool.Model.Barrel
+		
+		local Attachment = Instance.new("Attachment")
+		Attachment.Parent = Tool.Model.Barrel
+		
+		AlignPosition.Attachment0 = Attachment
+			
+		Configuration.ShootDebounce = MinigunStart		
+	end
+	
+	local Holding
+	local Add = .01
+	
+	local function StartHold()
+		Holding = true
+
+		if Equipped then
+			if Configuration.ShootType == "Auto" then
+				MadeClickSoundForNoAmmo = false
+				RunService:UnbindFromRenderStep("Fire")	
+				RunService:BindToRenderStep("Fire", 0, function() Fire() end)	
+
+				if Configuration.ShootType == "Minigun" then
+					AlignPosition.MaxTorque = MaxTorque
+
+					for i = 1, (Configuration.ShootDebounce - OriginalShootDebounce) * 100 do				
+						if not Holding then
+							break
+						end
+
+						Configuration.ShootDebounce -= Add
+						task.wait(.1)
+					end
+				end
+			elseif Configuration.ShootType == "Burst" then
+				if not BurstDebounce then
+					BurstDebounce = true
+					for i = 1, 3 do
+						Fire()
+						task.wait(Configuration.ShootDebounce)
+					end
+					task.wait(Configuration.FiringDebounce)
+					BurstDebounce = false
+				end
+			elseif Configuration.ShootType == "Shotgun" then
+				if not ShotgunDebounce then
+					ShotgunDebounce = true
+					Fire()
+					task.wait(Configuration.ShootDebounce)
+					ShotgunDebounce = false
+				end
+			else
+				Fire()
+			end	
+		end
+	end
+	
+	
+	
+	local function EndHold()
+		Holding = false
+		RunService:UnbindFromRenderStep("Fire")
+		if Configuration.ShootType == "Minigun" then
+			AlignPosition.MaxTorque = 0
+			
+			for i = 1, (MinigunStart - Configuration.ShootDebounce) * 100 do
+				if Holding then
+					break
+				end
+
+				Configuration.ShootDebounce += Add
+				task.wait(.1)
+			end	
+		end
+	end
+	
+	local function ShootClick(_, State)
+		if State.Name == "Begin" then	
+			StartHold()
+		elseif State.Name == "End" then			
+			EndHold()
+		end
+	end	
+
+	local BodyPartEvent = game.ReplicatedStorage.GunFramework.BodyPart
+	
+	local LeftCount = 0
+	local RightCount = 0
+	
+	local Changing = false
+	local OldTarget
+	local function ShoulderMovement()
+		local CameraDirection = HRP.CFrame:toObjectSpace(Camera.CFrame).LookVector * .3
+
+		if LeftShoulder then
+			local C0 = CFrame.new(-.8, 0.5, 0) * CFrame.Angles(0, math.rad(-90), -CameraDirection.Y)
+
+			if LeftShoulder.C0 ~= C0 then
+				LeftShoulder.C0 = C0
+				LeftCount += 1
+
+				if LeftCount == 3 then
+					LeftCount = 0
+
+					if CheckPlayerDistance.Check(HRP, 100) then
+						if not NPC then
+							BodyPartEvent:FireServer("Left Shoulder", C0)
+						else
+							game.ReplicatedStorage.GunFramework.BodyPartServer:Fire(Character, "Left Shoulder", C0)
+						end					
+					end
+				end
+			end	
+		end
+
+		if RightShoulder then			
+			local C0 = CFrame.new(.8, 0.5, 0) * CFrame.Angles(0, math.rad(90), CameraDirection.Y)
+
+			if RightShoulder.C0 ~= C0 then
+				RightShoulder.C0 = C0
+				RightCount += 1
+
+				if RightCount == 3 then
+					RightCount = 0
+					if CheckPlayerDistance.Check(HRP, 100) then
+						if not NPC then
+							BodyPartEvent:FireServer("Right Shoulder", C0)
+						else
+							game.ReplicatedStorage.GunFramework.BodyPartServer:Fire(Character, "Right Shoulder", C0)
+						end		
+					end
+				end
+			end		
+		end
+	end
+	
+	local function Inspect(_, State)
+		if State.Name == "Begin" and not Gun.Aiming then
+			PlayAnimation(InspectTrack, true)
+			PlayAnimation(ArmModelInspectTrack, true)
+		end
+	end
+
+	local function StartShoulderMovement()
+		RunService:UnbindFromRenderStep("SM")
+		RunService:BindToRenderStep("SM", Enum.RenderPriority.Character.Value, ShoulderMovement)
+	end
+
+	local function StopShoulderMovement()
+		RunService:UnbindFromRenderStep("SM")
+		TweenService:Create(RightShoulder, TweenInfo.new(.25, Enum.EasingStyle.Sine), {C0 = OriginalRightShoulderCFrame}):Play()
+		TweenService:Create(LeftShoulder, TweenInfo.new(.25, Enum.EasingStyle.Sine), {C0 = OriginalLeftShoulderCFrame}):Play()
+	end
+	
+	local StateConnection
+	
+	Tool.Equipped:Connect(function()	
+		if ArmModel then
+			ArmModel:SetAttribute("Active", true)
+		end
+		
+		Gun.CurrentBullets = GunAmmo
+		StateConnection = Character.Humanoid.StateChanged:Connect(function(Old, New)
+			if New.Name == "Landed" then
+				PlayAnimation(FallTrack, false)
+				PlayAnimation(ArmModelFallTrack, false)
+				PlayAnimation(LandTrack, true)
+				PlayAnimation(ArmModelLandTrack, true)
+			elseif New.Name == "Jumping" then
+				--PlayAnimation(JumpTrack, true)
+				--PlayAnimation(ArmModelJumpTrack, true)
+				--PlayAnimation(FallTrack, true)
+				--PlayAnimation(ArmModelFallTrack, true)
+			end
+		end)
+		
+		Equipped = true
+		if CustomCamera and not CustomCamera.InFirstPerson then
+			CustomCamera.StartThirdPerson()	
+		end
+		
+		ClientSound(NPC, Tool.Handle.Audios.Equip, true)
+		
+		PlayAnimation(EquipTrack, true)
+		PlayAnimation(ArmModelEquipTrack, true)
+		
+		PlayAnimation(IdleTrack, true)
+		PlayAnimation(ArmModelIdleTrack, true)
+
+		if not NPC then
+			CAS:BindAction("Inspect", Inspect, false, Enum.KeyCode.F)
+			CAS:BindAction("ShootClick", ShootClick, false, Enum.UserInputType.MouseButton1)
+			CAS:BindAction("AimState", AimState, false, Enum.UserInputType.MouseButton2)
+			CAS:BindAction("Reload", Reload, false, Enum.KeyCode.R)
+		end
+		
+		StartShoulderMovement()
+
+		CheckForLowAmmo(Gun.CurrentBullets, PerMag)
+		
+		if UIS:IsMouseButtonPressed(Enum.UserInputType.MouseButton2) then
+			Aim()
+		end
+
+		if UIS:IsMouseButtonPressed(Enum.UserInputType.MouseButton1) then
+			if Configuration.ShootType == "Auto" then
+				StartHold()
+			end
+		end	
+	end)
+	
+	Tool.Unequipped:Connect(function()
+		if ArmModel then
+			ArmModel:SetAttribute("Active")
+		end
+		GunAmmo = Gun.CurrentBullets
+		Equipped = false
+		--Player.PlayerGui.Sniper.Enabled = false
+		
+		ClientSound(NPC,  Tool.Handle.Audios.Reload, false)
+		Effects(Tool, NPC, {"Sounds", nil, nil, nil, nil, {Tool.Handle.Audios.Reload}})
+		
+		if Reloading then
+			Reloading = false
+		end
+		
+		PlayAnimation(UnequipTrack, true)
+		PlayAnimation(ArmModelUnequipTrack, true)
+
+		PlayAnimation(IdleTrack, false)
+		PlayAnimation(ArmModelIdleTrack, false)
+		
+		PlayAnimation(ReloadTrack, false)
+		PlayAnimation(ArmModelReloadTrack, false)
+
+		PlayAnimation(InspectTrack, false)
+		PlayAnimation(ArmModelInspectTrack, false)
+		
+		PlayAnimation(EquipTrack, false)
+		PlayAnimation(ArmModelEquipTrack, false)
+
+		--Sound.Play(nil, false)
+		--Tool.GunStuff.Events.Other:FireServer("Sounds", nil, nil, nil, nil, nil, nil, nil, false)
+
+		Gun.Aiming = false	
+		Unaim()
+		
+		StateConnection:Disconnect()
+		CAS:UnbindAction("Inspect")
+		CAS:UnbindAction("ShootClick")
+		CAS:UnbindAction("AimState")
+		CAS:UnbindAction("Reload")
+		RunService:UnbindFromRenderStep("Fire")
+		
+		task.wait()
+		local NewTool = Character:FindFirstChildWhichIsA("Tool")
+
+		if not NewTool then
+			ClientSound(NPC, Tool.Handle.Audios.Unequip, true)
+			StopShoulderMovement()
+
+			if CustomCamera and not CustomCamera.InFirstPerson then
+				CustomCamera.EndThirdPerson()
+			end
+		elseif Configuration.ShootType == "Sniper" and not NPC then
+			Player.PlayerGui.Sniper.Enabled = false
+		end		
+	end)
+	
+
+	if NPC then
+		local TargetPlayer
+		
+		--Death check
+		coroutine.wrap(function()	
+			while true do			
+				if NPC:GetAttribute("Health") <= 0 then
+					for i,v in pairs(NPC.Humanoid:GetPlayingAnimationTracks()) do
+						v:Stop()
+					end
+					
+					if TargetPlayer then
+						Character.PrimaryPart:SetNetworkOwner(nil)
+					end
+					
+					Ragdoll.RagdollCharacter(NPC)
+					NPC.HumanoidRootPart.LootPP.Enabled = true
+					Loot.setRandomNPCLoot(NPC)
+
+					task.wait(30)
+					NPC:Destroy()				
+					break
+				end
+
+				task.wait()
+			end
+		end)()
+		
+		
+		local function AttackPlayer()
+			local ClosestPlayer
+			TargetPlayer = nil
+			local MinimumDistance = 20
+
+			--FindTargetPlayer
+			coroutine.wrap(function()
+				while not TargetPlayer and IsAlive(Humanoid) do
+					for i, OtherPlayer in pairs(game.Players:GetPlayers()) do
+						if OtherPlayer.Character then
+							local OtherHRP = OtherPlayer.Character.HumanoidRootPart
+							--print(1)
+							if (OtherHRP.Position - HRP.Position).Magnitude < (TargetPlayer and (TargetPlayer.Character.HumanoidRootPart.Position - HRP.Position).Magnitude or 100000) then
+								--print(2)
+								ClosestPlayer = OtherPlayer 
+								local Direction = (OtherPlayer.Character.Head.Position - NPC.Head.Position).Unit
+								local Result = workspace:Raycast(NPC.Head.Position, Direction * MinimumDistance * 1.1)
+								if Result and Result.Instance:IsDescendantOf(OtherPlayer.Character) then
+									TargetPlayer = OtherPlayer
+									--print("FOUNDCLOSEST")
+									break
+								end	
+							end
+						end
+					end
+					--print(TargetPlayer)
+					task.wait(.1)
+				end
+			end)()
+	
+			repeat
+				task.wait()
+			until TargetPlayer or Character:GetAttribute("Health") < 100
+
+			TargetPlayer = ClosestPlayer --incase the npc is alerted from a gunshot
+			local TargetCharacter = TargetPlayer.Character
+			local TargetHRP = TargetCharacter.HumanoidRootPart
+			
+			local Torso = Character:WaitForChild("Torso")
+			local RootJoint = HRP:WaitForChild("RootJoint")
+			local LeftHipJoint = Torso["Left Hip"]
+			local RightHipJoint = Torso["Right Hip"]
+			
+			local OriginalNeck = Torso.Neck.C0
+			local OriginalRoot = RootJoint.C1
+			local OriginalLeftHip = LeftHipJoint.C0
+			local OriginalRightHip = RightHipJoint.C0
+
+			local InDistance
+			
+			--Tracking
+			coroutine.wrap(function()
+				while TargetCharacter.Humanoid.Health > 0 and IsAlive(Humanoid) do		
+					Camera.CFrame = CFrame.lookAt(Character.Head.Position, TargetCharacter.Head.Position)
+
+					local Value1 = 0
+					local Value2 = 0
+
+					if Humanoid.MoveDirection.Magnitude > 0 then
+						Value1 = HRP.CFrame.RightVector:Dot(Humanoid.MoveDirection)
+						Value2 = HRP.CFrame.LookVector:Dot(Humanoid.MoveDirection)
+					end
+
+					local CamX = 0 --workspace.CurrentCamera.CFrame.LookVector.X
+					local CamY = Camera.CFrame.LookVector.Y 
+					--print(CamY)
+					--print(CamX)
+
+
+					local X = math.rad(Value2 * 1)
+					local Y = math.rad(-Value1 * 3)
+					RootJoint.C1 = RootJoint.C1:Lerp(OriginalRoot * CFrame.new(0, -CamY, 0) * CFrame.Angles(-(X - CamY), -Y, -CamX), .2)
+					--Legs
+
+					local LeftHipAdd = CFrame.Angles(math.rad(-Value1 * 7), -CamX, CamY)
+					LeftHipJoint.C0 = LeftHipJoint.C0:Lerp(OriginalLeftHip * LeftHipAdd, .2)
+
+					local RightHipAdd = CFrame.Angles(math.rad(Value1 * 7), CamX, -CamY)	
+					RightHipJoint.C0 = RightHipJoint.C0:Lerp(OriginalRightHip * RightHipAdd, .2)
+
+					task.wait()
+				end
+			end)()
+			
+			local function SeeCheck()
+				local Direction = (TargetCharacter.Head.Position - Character.Head.Position).Unit								
+				local Result = workspace:Raycast(Character.Head.Position, Direction * 25, Parameters)
+				return Result and Result.Instance:IsDescendantOf(TargetCharacter)
+			end
+			
+			coroutine.wrap(function()
+				while TargetCharacter.Humanoid.Health > 0 and IsAlive(Humanoid) do					
+					if SeeCheck() then
+						if not Gun.Aiming then
+							Aim()
+						end
+						if math.random() < .2 then
+							--Round()
+							Fire()
+						end
+					end
+					
+					task.wait(.03)
+				end
+			end)()
+			
+			local CrouchIdle = Instance.new("Animation")
+			CrouchIdle.AnimationId = "rbxassetid://11505849642"
+			local CrouchIdleTrack = Humanoid:LoadAnimation(CrouchIdle)
+
+			local Walk = Instance.new("Animation")
+			Walk.AnimationId = "rbxassetid://12090962073"
+			local WalkTrack = Humanoid:LoadAnimation(Walk)
+
+			local Parameters = RaycastParams.new()
+			Parameters.FilterDescendantsInstances = {NPC}
+
+			--Distance check to follow player
+			coroutine.wrap(function()
+				while Humanoid.Health > 0 and NPC:GetAttribute("Health") > 0 do
+					local Distance = (TargetHRP.Position - HRP.Position).Magnitude	
+
+					local Direction = (TargetCharacter.Head.Position - NPC.Head.Position).Unit								
+					local Result = workspace:Raycast(NPC.Head.Position, Direction * 100000, Parameters)
+					local CanSee = Result and Result.Instance:IsDescendantOf(TargetCharacter)
+
+					if Distance > 15 or not CanSee then
+						PlayAnimation(CrouchIdleTrack)
+						PlayAnimation(WalkTrack, true)
+					else
+						PlayAnimation(CrouchIdleTrack, true)
+						PlayAnimation(WalkTrack)
+					end
+
+					task.wait()
+				end				
+			end)()
+			
+			NPC.PrimaryPart:SetNetworkOwner(TargetPlayer)
+			game.ReplicatedStorage.AttackPlayer:InvokeClient(TargetPlayer, NPC, TargetHRP)
+
+			if IsAlive(Humanoid) then
+				AttackPlayer()
+			end	
+		end	
+		AttackPlayer()	
+	end
+end
+
+function Gun.Other(Character, Type, TrailData, ParticleData, BulletHoleData, SoundData, BloodSplatData, NPCRagdollData)
+	for i, OtherPlayer in pairs(game.Players:GetPlayers()) do
+		if OtherPlayer.Character and Character and OtherPlayer.Character:FindFirstChild("HumanoidRootPart") and Character:FindFirstChild("HumanoidRootPart") then
+			local OtherHRP = OtherPlayer.Character.HumanoidRootPart
+			local HRP = Character.HumanoidRootPart
+			
+			if OtherPlayer.Character ~= Character and ((OtherHRP.Position - HRP.Position).Magnitude < 100 or Type == "Sounds") then
+				game.ReplicatedStorage.GunFramework.GunEffects:FireClient(OtherPlayer, Type, TrailData, ParticleData, BulletHoleData, SoundData, BloodSplatData, NPCRagdollData) 
+			end
+		end
+	end	
+end
+
+function Gun.Damage(Damager, HumanoidToDamage, Hit, Tool)
+	local Configuration = require(Tool.GunStuff:FindFirstChildWhichIsA("ModuleScript"))
+	local BaseDamage = GetDamage(Hit, Tool, Configuration)
+	
+	if Damager:IsA("Player") then
+		local DamagedIsPlayer = game.Players:GetPlayerFromCharacter(HumanoidToDamage.Parent)
+		if DamagedIsPlayer then
+			HumanoidToDamage:TakeDamage(BaseDamage)
+		else --Is NPC
+			HumanoidToDamage.Parent:SetAttribute("Health", (HumanoidToDamage.Parent:GetAttribute("Health") or HumanoidToDamage.MaxHealth) - BaseDamage)
+			for i, v in pairs(HumanoidToDamage.Parent:GetDescendants()) do
+				if v:IsA("BasePart") then
+					--v:SetNetworkOwner(Damager)
+				end
+			end
+		end
+	else
+		local NPCConfig = require(Damager:FindFirstChildWhichIsA("ModuleScript"))		
+		HumanoidToDamage:TakeDamage(BaseDamage * NPCConfig.DamageMultiplier)	
+	end
+end
+
+return Gun
