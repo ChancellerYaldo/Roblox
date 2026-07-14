@@ -1,0 +1,583 @@
+
+
+local RunService = game:GetService("RunService")
+local UIS = game:GetService("UserInputService")
+local CAS = game:GetService("ContextActionService")
+local TweenService = game:GetService("TweenService")
+
+local Player = game.Players.LocalPlayer
+local Character = Player.Character or Player.CharacterAdded:Wait()
+local Humanoid = Character:WaitForChild("Humanoid")
+local HRP = Character:WaitForChild("HumanoidRootPart")
+
+local Camera = workspace.CurrentCamera
+local Mouse = Player:GetMouse()
+
+local Gun = require(script.Parent:WaitForChild("Gun"))
+local Movement = require(script.Parent:WaitForChild("Movement"))
+
+local Lockpick = require(script.Parent.Lockpick)
+
+local X = 0
+local Y = -15
+
+local DefaultXSM = .35
+local DefaultYSM = .35
+
+local CurrentXSM = DefaultXSM
+local CurrentYSM = DefaultYSM
+
+UIS.MouseBehavior = Enum.MouseBehavior.Default
+UIS.MouseIconEnabled = true
+
+local FirstPersonOffset = (HRP.CFrame:ToObjectSpace(Character.Head.CFrame)).Position
+local NormalOffset = Vector3.new(0, FirstPersonOffset.Y, 15)
+
+local MainOffset = Instance.new("Vector3Value")
+MainOffset.Value = NormalOffset
+
+local ZOffset = Instance.new("NumberValue")
+ZOffset.Value = 15
+
+--local FHRP = game.ReplicatedStorage.GunFramework.Parts.FHRP:Clone()
+--FHRP.Parent = Character
+
+--Recoil
+local TotalValue = 0
+local ShotNumber = 0
+
+local function RecoilReset()
+
+	local StartShotNumber = ShotNumber
+	task.wait(.2)
+	
+	if StartShotNumber == ShotNumber then
+
+		local StartTotalValue = TotalValue
+		for i = 1, 15 do
+			if ShotNumber ~= StartShotNumber then
+				break
+			end
+
+			Y -= StartTotalValue/15
+			TotalValue -= StartTotalValue/15
+
+			if i == 15 then
+				TotalValue = 0
+			end
+			task.wait()
+		end
+
+	end
+end
+
+local function Clipping(TargetCameraCFrame, LeftOfCamera)
+	Character = Player.Character
+	local Origin = Character.Head.Position
+	local CameraPosition = TargetCameraCFrame.Position
+
+	local RightOfCamera = (TargetCameraCFrame * CFrame.new(1, 0, 0)).Position
+	local LeftOfCamera = (TargetCameraCFrame * CFrame.new(LeftOfCamera, 0, 0)).Position
+
+	local Direction1 = (RightOfCamera - Origin).Unit
+	local Direction2 = (LeftOfCamera - Origin).Unit
+
+	local Parameters = RaycastParams.new()
+	Parameters.FilterDescendantsInstances = {Character}
+	Parameters.CollisionGroup = "Characters"
+
+	local Distance = (CameraPosition - Origin).Magnitude + .5
+
+	local Result1 = workspace:Raycast(Origin, Direction1 * Distance, Parameters)	 	
+	local Result2 = workspace:Raycast(Origin, Direction2 * Distance, Parameters)
+
+	local CFrameLookAtHead
+	local x, y, z = TargetCameraCFrame:ToOrientation()
+	local MainDistance
+	if Result1 and Result2 then
+		if Result1.Distance < Result2.Distance then
+			MainDistance = Result1.Distance
+			CFrameLookAtHead = CFrame.lookAt(CameraPosition, Character.Head.Position)
+		else
+			MainDistance = Result2.Distance
+			CFrameLookAtHead = CFrame.lookAt(CameraPosition, Character.Head.Position)
+		end
+	elseif Result1 then
+		MainDistance = Result1.Distance
+		CFrameLookAtHead = CFrame.lookAt(CameraPosition, Character.Head.Position)
+	elseif Result2 then			
+		MainDistance = Result2.Distance
+		CFrameLookAtHead = CFrame.lookAt(CameraPosition, Character.Head.Position)
+	end
+	if MainDistance then
+		local OffsetForward = CFrame.new(0, 0, -(Distance - MainDistance))
+		local NewCameraPosition = (CFrameLookAtHead * OffsetForward).Position			
+		TargetCameraCFrame = CFrame.lookAt(NewCameraPosition, Character.Head.Position)
+	end
+	return TargetCameraCFrame
+end
+
+local function HasProperty(Object, PropertyName)
+	local Success, Result = pcall(function()
+		return Object[PropertyName]
+	end)
+
+	return Success and true
+end
+
+local TransparencyConnection
+
+local function CharacterTransparency(TargetTransparency)
+	Character = Player.Character
+	
+	local function a(v)
+		if HasProperty(v, "LocalTransparencyModifier") and (not v.Parent:IsA("Model") or v.Parent == Character) then
+			TweenService:Create(v, TweenInfo.new(.15, Enum.EasingStyle.Sine), {LocalTransparencyModifier = TargetTransparency}):Play()
+		end
+	end
+	
+	for i, v in pairs(Character:GetDescendants()) do
+		a(v)
+	end
+	
+	if TransparencyConnection then
+		TransparencyConnection:Disconnect()
+	end
+	TransparencyConnection = Character.DescendantAdded:Connect(a)
+end
+
+local CustomCamera = {}
+
+function CustomCamera.Sensitivity(Multiplier)
+	if Multiplier then
+		CurrentXSM *= Multiplier
+		CurrentYSM *= Multiplier
+	else
+		CurrentXSM = DefaultXSM
+		CurrentYSM = DefaultYSM
+	end
+end
+
+function CustomCamera.XRecoil()
+	local Val = Gun.Recoil.Value.X
+	Gun.Recoil.Value = Vector3.new(0, Gun.Recoil.Value.Y, 0)
+	for i = 1, 5 do
+		X += Val/5
+		task.wait()
+	end
+end
+
+function CustomCamera.YRecoil()
+	if Gun.Recoil.Value.Y > 0 then
+		ShotNumber += 1
+
+		local Val = Gun.Recoil.Value.Y
+		Gun.Recoil.Value = Vector3.new(Gun.Recoil.Value.X, 0, 0)
+
+		TotalValue += Val
+
+		coroutine.wrap(function()
+			for i = 1, 5 do
+				Y += Val/5
+				task.wait()
+			end
+		end)()
+
+		RecoilReset()
+	end
+end
+
+local ShiftlockedOffset = Vector3.new(2, 2, 7)
+
+local XDriftMin = -2
+local XDriftMax = 2
+local YDriftMin = -2
+local YDriftMax = 2
+
+local BaseMult = 12
+local CustomSwayZVal = -10
+local BaseSway = 1.5 -- Speed
+local SetSway = 1.5 -- Distance
+local BaseFreq = 15 -- view bobbing frequency
+local SetFreq = .12
+local BaseNumLerp = .25
+CustomCamera.DriftX = 0
+CustomCamera.DriftY = 0
+CustomCamera.BobbingYValue = 0
+local Velocity = 0
+
+
+CustomCamera.InThirdPerson = false
+CustomCamera.InFirstPerson = false
+
+
+CustomCamera.LeaningLeft = false
+CustomCamera.LeaningRight = false
+CustomCamera.LeaningValue = 0
+
+function NumLerp(Start, Goal, Alpha)
+	return Start + (Goal - Start) * Alpha
+end
+
+function GetMouseDrift(Drift, MouseDelta, DeltaTime)
+	return NumLerp(Drift.X, math.clamp(MouseDelta.X, XDriftMin, XDriftMax), (BaseMult * DeltaTime)), NumLerp(Drift.Y, math.clamp(MouseDelta.Y, YDriftMin, YDriftMax), (BaseMult * DeltaTime))
+end
+
+function GetSwayVal(x:number, y:number) : CFrame
+	return CFrame.new(Vector3.new(x, y, 0), Vector3.new(x * .95, y * .95, CustomSwayZVal)) + Camera.CFrame.Position
+end
+
+function GetVelocity() : number
+	return math.round(Vector3.new(HRP.AssemblyLinearVelocity.X, HRP.AssemblyLinearVelocity.Y, HRP.AssemblyLinearVelocity.Z).Magnitude)
+end
+
+function CalculateCurve(Base : number, Set : number) : number
+	return math.sin(os.clock() * Base) * Set
+end
+
+local DefaultSpeed = game.StarterPlayer.CharacterWalkSpeed
+local DefaultFOV = 90
+
+Camera.FieldOfView = DefaultFOV
+
+local OffsetTweeningTo = Vector3.zero
+local FOVTweeningTo = 0
+
+CustomCamera.TorsoTilt = CFrame.new(0, 0, 0)
+CustomCamera.ShakeOffset = Instance.new("Vector3Value")
+
+local GENERAL_LERP_VALUE = .5
+local LerpValue = GENERAL_LERP_VALUE
+
+local function MouseIcon()
+	local GuiOpened = Player.PlayerGui.Loot.Enabled
+	--print(GuiOpened)
+	UIS.MouseBehavior = GuiOpened and Enum.MouseBehavior.Default or Enum.MouseBehavior.LockCenter	
+	UIS.MouseIconEnabled = GuiOpened
+	Player.PlayerGui.RealCrosshair.Enabled = not GuiOpened
+end
+
+
+function CustomCamera.CameraCFrame(DeltaTime)
+	Character = Player.Character
+	
+	local Tool = Character:FindFirstChildWhichIsA("Tool")
+	local ConfigurationModule = Tool and Tool:FindFirstChild("GunStuff") and Tool.GunStuff:FindFirstChildWhichIsA("ModuleScript")
+	local Configuration = ConfigurationModule and require(ConfigurationModule)
+	local NewOffset = MainOffset.Value
+
+	if CustomCamera.InThirdPerson then
+		NewOffset = ShiftlockedOffset
+
+		if Configuration then
+			if Gun.Aiming then		
+				NewOffset = Configuration.AimingOffset	
+			else		
+				NewOffset = Configuration.HipfiringOffset
+			end			
+		end
+	elseif CustomCamera.InFirstPerson then
+		NewOffset = FirstPersonOffset
+	else
+		NewOffset = Vector3.new(0, FirstPersonOffset.Y, ZOffset.Value)
+	end
+	
+	local HeightOffset = (HRP.Position - Character.Torso.Position).Magnitude
+	NewOffset += Vector3.new(0, -HeightOffset * 1.25, 0)
+	
+	if NewOffset ~= OffsetTweeningTo then
+		CustomCamera.ChangeOffset(NewOffset)
+	end	
+	
+	local NewFOV = DefaultFOV
+	if CustomCamera.InFirstPerson and Configuration and Gun.Aiming then
+		NewFOV *= Configuration.FOVAimMultiplier
+	end
+	
+	if Movement.RealSprinting then
+		NewFOV = math.clamp(NewFOV * 1.1, DefaultFOV, 10000)
+	end
+	
+	if Movement.Sliding then
+		NewFOV *= 1.3
+	end
+	
+	FOVTweeningTo = NewFOV
+	Camera.FieldOfView = Lerp(Camera.FieldOfView, NewFOV, .1)
+	
+	if CustomCamera.InFirstPerson then
+		--print(GetVelMag())
+		Velocity = NumLerp(Velocity, GetVelocity(), BaseNumLerp)		
+	end
+	
+	local StartCFrame = CFrame.new(HRP.Position)
+		* CFrame.Angles(0, math.rad(X), 0) 
+		* CFrame.Angles(math.rad(Y), 0, 0)
+		* CFrame.new(CustomCamera.ShakeOffset.Value + Gun.ShootShakeOffset.Value)
+	
+	
+	if CustomCamera.InThirdPerson or CustomCamera.InFirstPerson then
+		HRP.CFrame = HRP.CFrame:Lerp(CFrame.new(HRP.Position) * CFrame.Angles(0, math.rad(X), 0), LerpValue)
+		if CustomCamera.InFirstPerson then	
+			if not Movement.Sliding then
+				CustomCamera.BobbingYValue = CalculateCurve(BaseFreq, SetFreq) * Velocity / BaseMult
+			else
+				CustomCamera.BobbingYValue = 0
+			end
+	
+			--print(math.floor(CustomCamera.BobbingYValue * 100) / 100)
+			StartCFrame *= CFrame.new(0, CustomCamera.BobbingYValue * .25, 0) --Bobbing
+		end
+			
+		local CameraFocus = StartCFrame * CFrame.new(MainOffset.Value.X, MainOffset.Value.Y, -10000)
+		local CameraCFrame = StartCFrame * CFrame.new(MainOffset.Value)
+
+		if CustomCamera.InThirdPerson then
+			CameraCFrame = Clipping(CameraCFrame, -.5)
+		end
+		
+		local TargetCFrame = CFrame.new(CameraCFrame.Position, CameraFocus.Position)
+		
+		if CustomCamera.InFirstPerson and not Lockpick.Lockpicking then
+			--Tilt
+			TargetCFrame *= CustomCamera.TorsoTilt
+			
+			--Drift
+			local MouseDelta = UIS:GetMouseDelta()
+			local DriftX, DriftY = GetMouseDrift(Vector2.new(CustomCamera.DriftX, CustomCamera.DriftY), MouseDelta, DeltaTime)
+			CustomCamera.DriftX = DriftX
+			CustomCamera.DriftY = DriftY
+			TargetCFrame *= CFrame.Angles(0, 0, math.rad(DriftX))
+			
+			--Sway
+			if not Gun.Aiming then
+				local Time = os.clock()
+				local Sway = GetSwayVal(math.cos(Time * BaseSway) * SetSway, math.sin(Time * BaseSway) * SetSway)
+				local X2, Y2, Z2 = Sway:ToEulerAnglesXYZ()
+				TargetCFrame *= CFrame.Angles(X2, Y2, Z2)
+			end
+		end
+		
+		MouseIcon()
+		--if CustomCamera.LeaningLeft then
+		--	CustomCamera.LeaningValue = NumLerp(CustomCamera.LeaningValue, 20, .2)
+		--elseif CustomCamera.LeaningRight then
+		--	CustomCamera.LeaningValue = NumLerp(CustomCamera.LeaningValue, -20, .2)			
+		--else
+		--	CustomCamera.LeaningValue = NumLerp(CustomCamera.LeaningValue, 0, .2)
+		--end
+		
+		Camera.CFrame = TargetCFrame
+		--UIS.MouseBehavior = Enum.MouseBehavior.LockCenter
+	else			
+		local CameraCFrame = StartCFrame * CFrame.new(MainOffset.Value)
+		Camera.CFrame = Camera.CFrame:Lerp(Clipping(CameraCFrame, -1), 1) -- .5 
+	end
+end
+
+function CustomCamera.ChangeOffset(NewOffset)
+	OffsetTweeningTo = NewOffset
+	TweenService:Create(MainOffset, TweenInfo.new(.05, Enum.EasingStyle.Sine), {Value = NewOffset}):Play()
+end
+
+local StaticZ = ZOffset.Value
+
+function CustomCamera.Zoom(_, State, Input)
+	if State.Name == "Change" then
+		if not CustomCamera.InFirstPerson and not CustomCamera.InThirdPerson then
+			StaticZ = math.clamp(StaticZ - Input.Position.Z * 5, 5, 50)
+			TweenService:Create(ZOffset, TweenInfo.new(.14, Enum.EasingStyle.Quad), {Value = StaticZ}):Play()
+		end
+	end
+end
+
+
+function CustomCamera.LockMouse(_, State, Input)
+	if not CustomCamera.InThirdPerson and not CustomCamera.InFirstPerson then
+		if State.Name == "Begin" then
+			UIS.MouseBehavior = Enum.MouseBehavior.LockCurrentPosition
+		elseif State.Name == "End" then
+			UIS.MouseBehavior = Enum.MouseBehavior.Default
+		end
+	end
+end
+
+function CustomCamera.MouseInput(_, State, Input)
+	if State.Name == "Change" then	
+		Y = math.clamp(Y - Input.Delta.Y * CurrentYSM, -80, 80)
+		X -= Input.Delta.X * CurrentXSM
+
+		if CustomCamera.InThirdPerson or CustomCamera.InFirstPerson then
+			if TotalValue ~= 0 then
+				if Input.Delta.Y > 0 then
+					TotalValue = math.clamp(TotalValue - Input.Delta.Y * CurrentYSM, 0, 10000000)
+				end
+			end
+		end
+	end
+end
+
+local function GetCameraOffset()
+	local StartCFrame = CFrame.new((HRP.Position)) 
+		* CFrame.Angles(0, math.rad(X), 0) 
+		* CFrame.Angles(math.rad(Y), 0, 0)
+	local CameraOffset = StartCFrame:ToObjectSpace(Camera.CFrame)
+	return CameraOffset
+end
+
+local OriginalOffset
+local OriginalFirstPersonOffset
+
+--local function DisableMouseIcon()
+--	UIS.MouseIconEnabled = true
+--	Player.PlayerGui.RealCrosshair.Enabled = false
+--end
+
+--DisableMouseIcon()
+
+local function End()
+	Humanoid.AutoRotate = true
+	UIS.MouseBehavior = Enum.MouseBehavior.Default
+	--DisableMouseIcon()
+	CharacterTransparency(0)	
+end
+
+local BodyPartEvent = game.ReplicatedStorage.GunFramework.BodyPart
+local Count = 0
+local RootJoint = HRP:WaitForChild("RootJoint")
+local OriginalRoot = RootJoint.C0
+local LeftHip = Character.Torso:WaitForChild("Left Hip")
+local OriginalLeft = LeftHip.C0
+local RightHip = Character.Torso:WaitForChild("Right Hip")
+local OriginalRight = RightHip.C0
+
+local function a()
+	local CameraDirection = HRP.CFrame:toObjectSpace(Camera.CFrame).LookVector
+
+	if RootJoint then
+		local C0 = OriginalRoot * CFrame.Angles(-CameraDirection.Y, 0, 0)
+
+		if RootJoint.C0 ~= C0 then
+			RootJoint.C0 = C0
+			--	LeftCount += 1
+
+			--	if LeftCount == 3 then
+			--		LeftCount = 0
+
+			--		if CheckPlayerDistance.Check(HRP, 100) then
+			--			BodyPartEvent:FireServer("Left Shoulder", C0)
+			--		end
+
+			--	end
+			--end	
+		end
+	end
+	
+	if LeftHip then
+		local C0 = OriginalLeft * CFrame.Angles(0, 0, CameraDirection.Y)
+
+		if LeftHip.C0 ~= C0 then
+			LeftHip.C0 = C0
+		end
+	end
+	
+	if RightHip then
+		local C0 = OriginalRight * CFrame.Angles(0, 0, -CameraDirection.Y)
+
+		if RightHip.C0 ~= C0 then
+			RightHip.C0 = C0
+		end
+	end
+end
+
+function Lerp(Start, Goal, Alpha)
+	return Start + (Goal - Start) * Alpha
+end
+
+function CustomCamera.StartThirdPerson()
+	if not CustomCamera.InThirdPerson then
+		if not CustomCamera.InFirstPerson then
+			OriginalOffset = MainOffset.Value
+		else
+			OriginalOffset = OriginalFirstPersonOffset
+		end
+
+		Humanoid.AutoRotate = false
+		CustomCamera.InFirstPerson = false
+		CharacterTransparency(0)
+		CustomCamera.InFirstPerson = false
+		CustomCamera.InThirdPerson = true
+		--MouseIcon()
+		
+		coroutine.wrap(function()
+			LerpValue = 0
+			for i = 1, 10 do
+				LerpValue = Lerp(LerpValue, GENERAL_LERP_VALUE, i / 10)
+				task.wait(.07)
+			end
+		end)()
+
+		MainOffset.Value = GetCameraOffset().Position
+	end
+end
+
+function CustomCamera.EndThirdPerson()
+	CustomCamera.InThirdPerson = false
+	End()
+	TweenService:Create(MainOffset, TweenInfo.new(.15, Enum.EasingStyle.Sine), {Value = OriginalOffset}):Play()
+end
+
+function CustomCamera.ThirdPerson(_, State)
+	Character = Player.Character
+	if State.Name == "Begin" and not Character:FindFirstChildWhichIsA("Tool") then
+		if not CustomCamera.InThirdPerson then
+			CustomCamera.StartThirdPerson()
+		else
+			CustomCamera.EndThirdPerson()
+		end
+	end
+end
+
+function CustomCamera.FirstPerson(_, State)
+	if State.Name == "Begin" then
+		CustomCamera.InFirstPerson = not CustomCamera.InFirstPerson
+
+		if CustomCamera.InFirstPerson then
+
+			if not CustomCamera.InThirdPerson then
+				OriginalFirstPersonOffset = MainOffset.Value
+			else
+				CustomCamera.InThirdPerson = false
+				OriginalFirstPersonOffset = OriginalOffset
+			end
+
+			--MouseIcon()
+			CharacterTransparency(1)
+		else			
+			End()
+			
+			local Tool = Character:FindFirstChildWhichIsA("Tool") 
+
+			if Tool then
+				task.wait()
+				CustomCamera.StartThirdPerson()
+			end
+		end
+	end
+end
+
+function CustomCamera.LeanLeft(_, State)
+	if State.Name == "Begin" then
+		CustomCamera.LeaningLeft = not CustomCamera.LeaningLeft
+		CustomCamera.LeaningRight = false
+	end
+end
+
+function CustomCamera.LeanRight(_, State)
+	if State.Name == "Begin" then
+		CustomCamera.LeaningRight = not CustomCamera.LeaningRight
+		CustomCamera.LeaningLeft = false
+	end
+end
+
+return CustomCamera
