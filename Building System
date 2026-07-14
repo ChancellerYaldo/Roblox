@@ -1,0 +1,226 @@
+local Guis = require(game.ReplicatedStorage.Modules.Guis)
+local RunService = game:GetService("RunService")
+local CAS = game:GetService("ContextActionService")
+local Player = game.Players.LocalPlayer
+local Character = Player.Character or Player.CharacterAdded:Wait()
+local cFrameModule = require(game.ReplicatedStorage.Modules.cFrame)
+
+local UIS = game:GetService("UserInputService")
+
+local Distance = 35
+
+local RayCastParameters = RaycastParams.new()
+RayCastParameters.FilterDescendantsInstances = {workspace.Baseplate}
+RayCastParameters.FilterType = Enum.RaycastFilterType.Include
+
+local NewBuilding
+
+local RunServiceConnection
+
+local function DisconnectFunction(Destroy)
+	RunServiceConnection:Disconnect()
+	CAS:UnbindAction("PlacedBuilding")
+	CAS:UnbindAction("CancelBuilding")
+	CAS:UnbindAction("RotateBuilding")
+end
+
+local function CancelBuilding(ActionName, State, Bypass)
+	if Bypass or State.Name == "Begin" then
+		DisconnectFunction()
+		NewBuilding:Destroy()
+	end
+end
+
+local function TooFar(RayOrigin, RayDirection, DifferentDistance)
+	local EndPoint = RayOrigin + RayDirection * (DifferentDistance or Distance)
+	local NewResult = workspace:Raycast(EndPoint, Vector3.new(0, -100000000, 0))
+
+	if NewResult then
+		return NewResult.Position, NewResult.Instance
+	end
+end
+
+
+local function GetPlacingPosition(Building)
+		local Mouse2D = UIS:GetMouseLocation()
+		local ray = game.Workspace.CurrentCamera:ViewportPointToRay(Mouse2D.X, Mouse2D.Y)
+		local Result = workspace:Raycast(ray.Origin, ray.Direction * Distance)
+
+		local function Action(result)
+
+			local Attachable = false
+			for i, Part in pairs(Building:GetChildren()) do
+				local Attachment, Replaced = string.gsub(Part.Name, "Attachment", "")
+				local Attachment, Replaced2 = string.gsub(result.Instance.Name, "Attachment", "")
+				if Replaced > 0 and Replaced2 > 0 and (Part.Name ~= result.Instance.Name or Part.Name == "AnyAttachment") then
+					Attachable = true
+					break
+				end
+			end
+
+			if result.Instance.Name == "Baseplate" then
+				return result.Position, result.Instance
+			elseif Result.Instance.Name == Building.Name.."Attachment" or Attachable then
+				return result.Position, result.Instance, true
+			else
+				local NewResult = workspace:Raycast(result.Position, ray.Direction * (Distance - result.Distance), RayCastParameters)
+
+				if NewResult then
+					return NewResult.Position, NewResult.Instance
+				else
+					return TooFar(result.Position, ray.Direction, Distance - result.Distance)
+				end
+			end
+
+		end
+
+
+
+		if Result then
+			return Action(Result)	
+		else
+			return TooFar(ray.Origin, ray.Direction)
+		end
+	end
+
+local BuildingModule = {}
+
+function BuildingModule.PlacingBuilding(Building)
+
+	if NewBuilding then
+		CancelBuilding(nil, nil, true)
+	end
+	
+	Guis.BuildingState(false) --disables gui 
+	NewBuilding = Building:Clone()
+
+	NewBuilding.Parent = workspace
+	
+	local Placeable = true
+	
+	for i, v in pairs(NewBuilding:GetChildren()) do
+		v:SetAttribute("OriginalColor", v.BrickColor)
+		v:SetAttribute("OriginalTransparency", v.Transparency)
+		v.BrickColor = BrickColor.new("Lime green")
+		v.CanCollide = false
+		v.CanQuery = false
+		
+		if v.Transparency ~= 1 then
+			v.Transparency = .4
+		end
+		
+	end
+	
+	
+	
+	RunServiceConnection = RunService.RenderStepped:Connect(function()	
+		local MousePosition, MouseHit, Locking = GetPlacingPosition(NewBuilding)	
+		
+		if MousePosition then
+			if Locking then
+				for i, v in pairs(NewBuilding:GetChildren()) do
+					v.BrickColor = BrickColor.new("Really blue")
+				end
+				Placeable = true
+					
+				local TubeAttachment = NewBuilding[NewBuilding:GetAttribute("AttachmentType").."Attachment"]
+				
+				for i, v in pairs(NewBuilding:GetChildren()) do
+					v:SetAttribute("CFrameToTubeAttachment", TubeAttachment.CFrame:ToObjectSpace(v.CFrame))
+				end
+			
+				TubeAttachment.CFrame = MouseHit.CFrame * CFrame.Angles(0, math.rad(180), 0)	
+				
+			
+				for i, v in pairs(NewBuilding:GetChildren()) do
+					v.CFrame = TubeAttachment.CFrame:ToWorldSpace(v:GetAttribute("CFrameToTubeAttachment"))
+				end
+
+				
+			else
+				local SnappedPosition = Vector3.new(math.floor(MousePosition.X), math.floor(MousePosition.Y), math.floor(MousePosition.Z))		
+				local Size = NewBuilding.PrimaryPart.Size
+				local NewPosition = SnappedPosition + Vector3.new(0, Size.Y/2, 0)
+				cFrameModule.MoveTo(NewBuilding, NewPosition) --moves model 
+				
+				local function GetTouchingParts(part) --DO NOT REMOVE, this is because if u get "GetTouchingParts" while the part is cancollide = false, it will not work. This fixes it somehow
+					local Connection = part.Touched:Connect(function() end)
+					local Results = part:GetTouchingParts()
+					Connection:Disconnect()
+					return Results
+				end
+
+				local MadeNotPlaceable = false
+
+				local function MakeNonPlaceable()
+					Placeable = false
+					MadeNotPlaceable = true
+					for i, v in pairs(NewBuilding:GetChildren()) do
+						v.BrickColor = BrickColor.new("Bright red")
+					end
+				end
+				
+				for i, Part in pairs(NewBuilding:GetChildren()) do
+					local Touches = GetTouchingParts(Part)
+
+					for i, Touch in pairs(Touches) do
+						if Touch.Parent ~= Part.Parent and Touch.Name ~= "Baseplate" then
+							MakeNonPlaceable()
+							break
+						end
+					end
+
+					if MadeNotPlaceable then
+						break
+					end
+				end
+				
+				if Building.Name == "Tube" then
+					MakeNonPlaceable()
+				end
+
+				if not MadeNotPlaceable then
+					Placeable = true
+
+					for i, v in pairs(NewBuilding:GetChildren()) do
+						v.BrickColor = BrickColor.new("Lime green")
+					end
+				end
+			end
+		end
+		
+		
+	end)
+	
+	local function PlacedBuilding(ActionName, State)
+		if State.Name == "Begin" and Placeable then
+			DisconnectFunction()
+			for i, v in pairs(NewBuilding:GetChildren()) do
+				v.CanCollide = true
+				v.CanQuery = true
+				v.Transparency = v:GetAttribute("OriginalTransparency")
+				v.BrickColor = v:GetAttribute("OriginalColor")
+			end
+			NewBuilding = nil
+			
+			if Building.Name == "Tube" then
+				BuildingModule.PlacingBuilding(Building)
+			end
+			
+		end
+	end
+	
+	local function RotateBuilding(ActionName, State)
+		if State.Name == "Begin" then
+			--Instance.new("Model"):Pi
+			cFrameModule.Rotate(NewBuilding, CFrame.Angles(0, math.rad(90), 0)) --rotates model
+		end
+	end
+	
+	CAS:BindAction("PlacedBuilding", PlacedBuilding, true, Enum.UserInputType.MouseButton1)
+	CAS:BindAction("CancelBuilding", CancelBuilding, true, Enum.UserInputType.MouseButton3)
+	CAS:BindAction("RotateBuilding", RotateBuilding, true, Enum.KeyCode.R)
+	
+end
+
+return BuildingModule
