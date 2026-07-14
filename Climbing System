@@ -1,0 +1,192 @@
+local UIS = game:GetService("UserInputService")
+local TweenService = game:GetService("TweenService")
+local RunService = game:GetService("RunService")
+local CAS = game:GetService("ContextActionService")
+local Player = game.Players.LocalPlayer
+local Character = Player.Character or Player.CharacterAdded:Wait()
+local Humanoid = Character:WaitForChild("Humanoid")
+local HRP = Character:WaitForChild("HumanoidRootPart")
+local Camera = workspace.CurrentCamera
+
+local LeftShoulder = Character:FindFirstChild("Left Shoulder", true)
+local RightShoulder = Character:FindFirstChild("Right Shoulder", true)
+local LeftArm = Character:WaitForChild("Left Arm")
+local RightArm = Character:WaitForChild("Right Arm")
+local LeftFromHRP = HRP.CFrame:ToObjectSpace(LeftArm.CFrame)
+local RightFromHRP = HRP.CFrame:ToObjectSpace(RightArm.CFrame)
+
+local AttemptingToClimb = false
+local Climbing = false
+local Hanging = false
+
+local RegionPart1 = workspace.RegionPart
+local RegionPart1Size = RegionPart1.Size
+local RegionPart2 = workspace.RegionPart2
+local RegionPart2Size = RegionPart2.Size
+
+local InAir = false
+Humanoid.StateChanged:Connect(function(Old, New)
+	if New.Name == "Jumping" then
+		InAir = true
+	elseif New.Name == "Landed" then
+		InAir = false
+	end
+end)
+
+local AP = Instance.new("AlignPosition")
+AP.Enabled = false
+AP.Mode = Enum.PositionAlignmentMode.OneAttachment
+AP.Attachment0 = HRP.RootAttachment
+AP.Responsiveness = 20
+AP.MaxForce = math.huge
+AP.Parent = HRP
+
+local Parameters = RaycastParams.new()
+Parameters.FilterDescendantsInstances = {Character}
+
+local function ArmsLookAtPosition(Lookat, LeftOfDistance, RightOfDistance)
+	LeftShoulder.Enabled = false
+	RightShoulder.Enabled = false
+	
+	local LeftOfLookat = Lookat + -HRP.CFrame.RightVector * LeftOfDistance
+	local RightOfLookat = Lookat + HRP.CFrame.RightVector * RightOfDistance
+	
+	LeftArm.CFrame = CFrame.lookAt(HRP.CFrame:ToWorldSpace(LeftFromHRP).Position, LeftOfLookat) * CFrame.Angles(math.rad(90), 90, 0) * CFrame.new(0, -1.8, 0)
+	RightArm.CFrame = CFrame.lookAt(HRP.CFrame:ToWorldSpace(RightFromHRP).Position, RightOfLookat) * CFrame.Angles(math.rad(90), -90, 0) * CFrame.new(0, -1.8, 0)
+end
+
+local function RepeatUntil(TargetPosition, Magnitude)
+	repeat 
+		task.wait()
+	until (HRP.Position - TargetPosition).Magnitude < Magnitude
+end
+
+local function Jump(ActionName, State)
+	if State.Name == "Begin" and Hanging then
+		Humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
+		CAS:UnbindAction("Jump")
+		AP.Enabled = false
+		Humanoid.AutoRotate = true
+		RunService:UnbindFromRenderStep("ArmsLookAtPosition")
+		LeftShoulder.Enabled = true
+		RightShoulder.Enabled = true	
+		task.wait(.4)
+		Hanging = false
+	end	
+end
+
+local function AttemptClimb()
+	if UIS:IsKeyDown(Enum.KeyCode.Space) and not Climbing and InAir and not Hanging and not AttemptingToClimb and Humanoid.MoveDirection ~= Vector3.zero then
+		AttemptingToClimb = true
+		--local Origin = HRP.Position + Vector3.new(0, HRP.Size.Y/2, 0)
+		local Origin = Character:WaitForChild("Head").Position
+		local Direction = HRP.CFrame.LookVector * 2
+		
+		local Min = -2 --Studs from Head
+		local Max = 2 --
+				
+		for i = math.abs(Min) + math.abs(Max), 1, -.1 do
+			local Result = workspace:Raycast(Origin + Vector3.new(0, i + Min, 0), Direction, Parameters)
+			
+			if Result and Result.Normal.Y > -.6 and Result.Normal.Y < .8 then
+				local Part = Result.Instance
+				local DistanceFromTop = -(HRP.Position - (Part.Position + Part.Size/2)).Y
+
+				local BasePosition = CFrame.lookAt(Result.Position, Result.Position - Result.Normal) * CFrame.new(0, 0, -RegionPart1Size.Z/2)
+				local FinalPosition = Vector3.new(BasePosition.X, Part.Position.Y + Part.Size.Y/2 + 3.5, BasePosition.Z)		
+				local TargetPoint = FinalPosition + Vector3.new(0, -.5, 0)
+				
+				local function GetExtreme(Extreme, RegionPartSize, Position)	
+					
+					local TargetCFrame = CFrame.lookAt(Position, Position + Result.Normal)
+					
+					local Min = (TargetCFrame * CFrame.new(-RegionPartSize.X/2, -RegionPartSize.Y/2, -RegionPartSize.Z/2)).Position
+					local Max = (TargetCFrame * CFrame.new(RegionPartSize.X/2, RegionPartSize.Y/2, RegionPartSize.Z/2)).Position
+		
+					if Extreme == "Min" then					
+						return Vector3.new(math.min(Min.X, Max.X), math.min(Min.Y, Max.Y), math.min(Min.Z, Max.Z))						
+					else
+						return Vector3.new(math.max(Min.X, Max.X), math.max(Min.Y, Max.Y), math.max(Min.Z, Max.Z))			
+					end				
+					
+				end
+				
+				local Min = GetExtreme("Min", RegionPart1Size, TargetPoint)
+				local Max = GetExtreme("Max", RegionPart1Size, TargetPoint)
+				
+				local Region = Region3.new(Min, Max)
+				
+				RegionPart1.CFrame = Region.CFrame
+				RegionPart1.Size = Region.Size
+				
+				local Parts = workspace:FindPartsInRegion3WithIgnoreList(Region, {Character, Part})
+
+				if DistanceFromTop < 7 then
+					if #Parts == 0 then
+						Climbing = true
+						Humanoid.WalkSpeed = 0
+
+						RunService:BindToRenderStep("ArmsLookAtPosition", 0, function() ArmsLookAtPosition(FinalPosition + Vector3.new(0, -3.5, 0), 2, 2) end)
+						--CAS:BindAction("DisableMovement", function() end, false, Enum.KeyCode.W, Enum.KeyCode.A, Enum.KeyCode.S, Enum.KeyCode.D)
+
+						Humanoid.AutoRotate = false
+						local TopPosition = Vector3.new(HRP.Position.X, Part.Position.Y + Part.Size.Y/2 + 3.5, HRP.Position.Z)	
+						AP.Position = TopPosition	
+						AP.Enabled = true	
+						
+						RepeatUntil(TopPosition, 2)
+						AP.Position = FinalPosition			
+						RepeatUntil(FinalPosition, 1.5)
+						local Direction = HRP.CFrame.LookVector * Vector3.new(1, 0, 1)
+						HRP.AssemblyLinearVelocity = Direction.Unit * 25
+
+						--CAS:UnbindAction("DisableMovement")
+						RunService:UnbindFromRenderStep("ArmsLookAtPosition")
+						LeftShoulder.Enabled = true
+						RightShoulder.Enabled = true
+						AP.Enabled = false		
+						Humanoid.WalkSpeed = game.StarterPlayer.CharacterWalkSpeed 
+						Climbing = false
+						Humanoid.AutoRotate = true
+						break
+					else
+
+						
+					
+						local BasePosition = CFrame.lookAt(Result.Position, Result.Position - Result.Normal) * CFrame.new(0, 0, -RegionPart2Size.Z/2)
+						local FinalPosition = Vector3.new(BasePosition.X, Part.Position.Y + Part.Size.Y/2 + RegionPart2Size.Y/2, BasePosition.Z)		
+	
+						local Min = GetExtreme("Min", RegionPart2Size, FinalPosition)
+						local Max = GetExtreme("Max", RegionPart2Size, FinalPosition)
+						local Region = Region3.new(Min, Max)
+						
+						RegionPart2.CFrame = Region.CFrame
+						RegionPart2.Size = Region.Size
+						
+						local Parts = workspace:FindPartsInRegion3WithIgnoreList(Region, {Character, Part})
+
+						if #Parts == 0 then
+							CAS:BindAction("Jump", Jump, true, Enum.KeyCode.Space)
+							Hanging = true
+							RunService:BindToRenderStep("ArmsLookAtPosition", 0, function() ArmsLookAtPosition(Vector3.new(Result.Position.X, Part.Position.Y + Part.Size.Y/2, Result.Position.Z), .25, .25) end)
+							Humanoid.AutoRotate = false
+							local HangPosition1 = (CFrame.lookAt(Result.Position, Result.Position + Result.Normal) * CFrame.new(0, 0, -.85)).Position
+							local HangPosition2 = Vector3.new(HangPosition1.X, Part.Position.Y + Part.Size.Y/2 - 2.5, HangPosition1.Z)
+							AP.Position = HangPosition2
+							AP.Enabled = true				
+							break
+						end
+						
+					end
+					
+				end
+			end
+			
+		end 
+		
+
+		AttemptingToClimb = false
+	end
+end
+
+RunService.RenderStepped:Connect(AttemptClimb)
