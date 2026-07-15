@@ -1,54 +1,63 @@
 Connected Discord-GitHub
 
 --[[
-	Gun module overview
+	Gun module
 
-	This module manages the shared behavior for player and NPC firearms. It handles:
-	- aiming and camera sensitivity changes;
-	- crosshair hit feedback;
-	- raycast-based shooting and recursive bullet penetration;
-	- damage, hit effects, bullet trails, and bullet holes;
-	- recoil and camera shake;
-	- reloading and ammunition state;
-	- animation loading and playback;
-	- multiple firing modes, including automatic, burst, shotgun, sniper, and minigun behavior.
+	This module manages shared firearm behavior for player-controlled weapons and NPC weapons.
+	The public API is kept compatible with the previous version, while the implementation is
+	split into smaller helpers so each function has one clear responsibility.
 
-	The same module can run on both the client and server. Client-only visual behavior is
-	guarded with RunService:IsClient(), while shared effects are routed through the
-	Effects helper so the correct client/server path is used.
+	The main design decisions are:
+	- Guard clauses reject invalid states early instead of wrapping the main path in deep nesting.
+	- Expensive or repeated lookups, such as the weapon configuration, are cached on each client.
+	- Raycast hit handling is split between character hits and world-surface hits.
+	- Bullet penetration carries a finite amount of strength and has a recursion limit so malformed
+	  geometry or unexpected material data cannot create an endless chain of recursive rays.
+	- Comments focus on reasoning and relationships between systems rather than narrating obvious lines.
 ]]
 
--- Services used for input binding, execution-context checks, tweens, and direct input state.
-local CAS = game:GetService("ContextActionService")
+local ContextActionService = game:GetService("ContextActionService")
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
 local TweenService = game:GetService("TweenService")
-local UIS = game:GetService("UserInputService")
+local UserInputService = game:GetService("UserInputService")
 
+local IS_CLIENT = RunService:IsClient()
+local RNG = Random.new()
+local nextClientId = 0
 
+local modulesFolder = ReplicatedStorage:WaitForChild("Modules")
+local gunFramework = ReplicatedStorage:WaitForChild("GunFramework")
 
--- Shared dependencies are loaded in both execution contexts. Camera and crosshair modules
--- are client-only because they control local visual state that should not run on the server.
-local Ragdoll = require(game.ReplicatedStorage.Modules.Ragdoll)
 local CustomCamera
 local CrosshairModule
-if RunService:IsClient() then
-	CustomCamera = require(game.ReplicatedStorage.Modules.CustomCamera)
-	CrosshairModule = require(game.ReplicatedStorage.Modules.Crosshair)
+
+if IS_CLIENT then
+	CustomCamera = require(modulesFolder:WaitForChild("CustomCamera"))
+	CrosshairModule = require(modulesFolder:WaitForChild("Crosshair"))
 end
 
-local GunEffects = require(script.GunEffects)
-local General = require(game.ReplicatedStorage.Modules.General)
+local GunEffects = require(script:WaitForChild("GunEffects"))
+local General = require(modulesFolder:WaitForChild("General"))
 
--- Crosshair size constants used to animate a hit marker from its initial size,
--- through a short impact pulse, and then down to a smaller resting size.
-local START_SIZE = UDim2.fromScale(.051, .088)
-local PEAK_SIZE = UDim2.fromScale(.051 * 2, .088 * 2) 
-local MIN_SIZE = UDim2.fromScale(.051 * .75, .088 * .75) 
+local MAX_RAY_DISTANCE = 1000
+local DEFAULT_BULLET_STRENGTH = 100
+local MAX_PENETRATIONS = 8
+local DEFAULT_MATERIAL_RESISTANCE = 75
 
+local CROSSHAIR_START_SIZE = UDim2.fromScale(0.051, 0.088)
+local CROSSHAIR_PEAK_SIZE = UDim2.fromScale(0.051 * 2, 0.088 * 2)
+local CROSSHAIR_MIN_SIZE = UDim2.fromScale(0.051 * 0.75, 0.088 * 0.75)
 
--- MaterialHealths represents how much penetration strength a bullet loses when it passes
--- through a character or physical material. Higher values make surfaces harder to penetrate.
-local MaterialHealths = {
+local MINIGUN_START_DEBOUNCE = 0.18
+local MINIGUN_DEBOUNCE_STEP = 0.01
+local MINIGUN_MAX_TORQUE = 5
+
+-- These values represent how much penetration strength a bullet loses after passing through
+-- a target or material. The same table therefore controls both whether penetration is allowed
+-- and how much strength remains for the next recursive ray.
+local MATERIAL_RESISTANCE = {
 	Player = 33,
 	Metal = 101,
 	Brick = 101,
@@ -63,30 +72,6 @@ local MaterialHealths = {
 	Mud = 10,
 }
 
-
-
-
--- Returns the bullet's remaining penetration strength after passing through a material.
--- Unknown materials use a fallback resistance of 75 so unsupported surfaces still have
--- predictable penetration behavior.
-local function GetHealth(CurrentHealth, MaterialName)
-	return CurrentHealth - (MaterialHealths[MaterialName] or 75)
-end
-
-
--- Safely checks whether an Instance exposes a property without throwing an error.
--- pcall is used because indexing an invalid Roblox property raises an exception.
-local function HasProperty(Object, PropertyName)
-	local Success, Result = pcall(function()
-		return Object[PropertyName]
-	end)
-	
-	return Success and true
-end
-
-
-
--- Public state shared by all gun clients created from this module.
 local Gun = {}
 
 Gun.Ammo = {
@@ -94,51 +79,10 @@ Gun.Ammo = {
 	Medium = 300,
 }
 
+-- Kept for compatibility with any UI or external code that already reads this field.
+-- Individual weapon clients still save and restore their own magazine value on equip/unequip.
 Gun.CurrentBullets = 0
 
-
--- Adds reserve ammunition to one ammo category without changing the current magazine.
-function Gun.GiveAmmo(Type, ToAdd)
-	Gun.Ammo[Type] += ToAdd
-end
-
-
--- Plays or stops a sound only on the client. This prevents visual/audio presentation logic
--- from being executed by the server, which does not need to render local feedback.
-local function ClientSound(Sound, State)
-	if RunService:IsClient() then
-		if State then
-			Sound:Play()
-		else
-			Sound:Stop()
-		end
-	end
-end
-
-
--- Routes an effect request through the correct execution path.
--- On the client, the request is sent to the server so other players can receive it.
--- On the server, the shared General module applies the effect directly.
-local function Effects(Tool, Character, Parameters)
-	if RunService:IsClient() then
-		Tool.GunStuff.Events.Other:FireServer(unpack(Parameters))
-	else
-		General.Other(Character, unpack(Parameters))
-	end
-end
-
-
--- Runs purely local effects such as trails, particles, blood splats, or bullet holes.
--- The Type key selects the effect function dynamically from the GunEffects module.
-local function ClientEffects(GunEffects, Type, Parameters)
-	if RunService:IsClient() then
-		GunEffects[Type](unpack(Parameters))
-	end
-end
-
-
--- ClientTemplate acts as a metatable-backed firearm object. Each equipped weapon gets its own
--- state table while sharing these methods, avoiding duplicated method closures per weapon.
 local ClientTemplate = {}
 ClientTemplate.__index = ClientTemplate
 ClientTemplate.Enemies = {}
@@ -146,52 +90,822 @@ ClientTemplate.PlayerClients = {}
 
 Gun.ClientTemplate = ClientTemplate
 
+local function getMaterialResistance(materialName)
+	return MATERIAL_RESISTANCE[materialName] or DEFAULT_MATERIAL_RESISTANCE
+end
 
--- Creates a new firearm client object and records whether it belongs to a real player or an NPC.
--- Player weapon objects are indexed by Tool for fast lookup; NPC objects are stored as a list.
-local function CopyClientTemplate(Tool, Character)
-	local Player = game.Players:GetPlayerFromCharacter(Character)
-	local Client = setmetatable({}, ClientTemplate)
-	Client.Character = Character
-	Client.Player = Player
-	Client.Tool = Tool
+local function getRemainingBulletStrength(currentStrength, materialName)
+	return currentStrength - getMaterialResistance(materialName)
+end
 
-	if not Player then
-		table.insert(ClientTemplate.Enemies, Client)
+local function playClientSound(sound, shouldPlay)
+	if not IS_CLIENT then
+		return
+	end
+
+	if shouldPlay then
+		sound:Play()
+		return
+	end
+
+	sound:Stop()
+end
+
+-- Visual effects need different routes depending on execution context. A client requests the
+-- server to replicate shared effects, while the server can apply the same effect directly.
+local function dispatchEffect(tool, character, ...)
+	if IS_CLIENT then
+		tool.GunStuff.Events.Other:FireServer(...)
+		return
+	end
+
+	General.Other(character, ...)
+end
+
+local function runClientEffect(effectType, parameters)
+	if not IS_CLIENT then
+		return
+	end
+
+	local effectFunction = GunEffects[effectType]
+	if not effectFunction then
+		return
+	end
+
+	effectFunction(table.unpack(parameters))
+end
+
+local function isAutomaticShootType(shootType)
+	return shootType == "Auto" or shootType == "Minigun"
+end
+
+local function getNumericValue(value, fallback)
+	if type(value) == "number" then
+		return value
+	end
+
+	if typeof(value) == "Instance" and value:IsA("ValueBase") then
+		return value.Value
+	end
+
+	return fallback
+end
+
+local function setFrameProperty(container, propertyName, value)
+	for _, child in ipairs(container:GetChildren()) do
+		if child:IsA("Frame") then
+			child[propertyName] = value
+		end
+	end
+end
+
+local function createClient(tool, character)
+	local player = Players:GetPlayerFromCharacter(character)
+	local client = setmetatable({}, ClientTemplate)
+
+	nextClientId += 1
+	client.Id = nextClientId
+	client.Character = character
+	client.Player = player
+	client.Tool = tool
+	client.Configuration = require(tool.GunStuff.Configuration)
+	client.MainFrame = nil
+	client.Reloading = false
+	client.AimDebounce = false
+	client.ShootDebounce = false
+	client.MadeClickSoundForNoAmmo = false
+	client.Equipping = false
+	client.Equipped = false
+	client.HoldingTrigger = false
+	client.BurstDebounce = false
+	client.ShotgunDebounce = false
+	client.AutomaticLoopVersion = 0
+	client.StoredBullets = client.Configuration.PerMag
+	client.CurrentShootDebounce = client.Configuration.ShootDebounce
+
+	if player then
+		ClientTemplate.PlayerClients[tool] = client
 	else
-		ClientTemplate.PlayerClients[Tool] = Client
+		table.insert(ClientTemplate.Enemies, client)
 	end
-	return Client
+
+	return client
 end
 
+local function createFallbackCamera(character)
+	local cameraProxy = Instance.new("Part")
+	cameraProxy.Size = Vector3.zero
+	cameraProxy.Transparency = 1
+	cameraProxy.Anchored = true
+	cameraProxy.CanCollide = false
+	cameraProxy.CanTouch = false
+	cameraProxy.CanQuery = false
+	cameraProxy.CFrame = character.Head.CFrame
+	cameraProxy.Name = "Camera"
+	cameraProxy.Parent = character
 
--- Enters the aiming state only when the weapon is not reloading, aim is not temporarily blocked,
--- and the character is alive. Aiming also reduces camera sensitivity using weapon configuration.
+	return cameraProxy
+end
+
+local function getWeaponCamera(character)
+	if IS_CLIENT and workspace.CurrentCamera then
+		return workspace.CurrentCamera
+	end
+
+	-- NPCs and server-side weapons still need a CFrame that represents their aim direction.
+	-- A non-colliding proxy gives the existing API a camera-like object without client rendering.
+	return createFallbackCamera(character)
+end
+
+local function getTargetData(hitPart)
+	local character = hitPart:FindFirstAncestorWhichIsA("Model")
+	if not character then
+		return nil
+	end
+
+	local humanoid = character:FindFirstChildWhichIsA("Humanoid")
+	if not humanoid then
+		return nil
+	end
+
+	return character, humanoid, Players:GetPlayerFromCharacter(character)
+end
+
+local function isFriendlyTarget(shooterPlayer, targetPlayer)
+	if not shooterPlayer or not targetPlayer or not targetPlayer.Team then
+		return false
+	end
+
+	return shooterPlayer.Team == targetPlayer.Team
+end
+
+local function passesNpcHitChance(client)
+	if client.Player then
+		return true
+	end
+
+	local enemyConfigModule = client.Character:FindFirstChildWhichIsA("ModuleScript")
+	if not enemyConfigModule then
+		return true
+	end
+
+	local enemyConfig = require(enemyConfigModule)
+	return RNG:NextNumber() < (enemyConfig.HitChance or 1)
+end
+
+local function getHitFeedbackStyle(hitPart)
+	if General.HeadCheck(hitPart) then
+		return gunFramework.Sounds.Headshot, Color3.fromRGB(255, 255, 0)
+	end
+
+	return gunFramework.Sounds.Bodyshot, Color3.fromRGB(255, 255, 255)
+end
+
+local function getOrCreateDamageGui(targetRootPart, baseDamage)
+	local gui = targetRootPart:FindFirstChild("DamageNumbers")
+
+	if gui then
+		gui:SetAttribute("Hits", (gui:GetAttribute("Hits") or 0) + 1)
+		gui.TextLabel.Text = (tonumber(gui.TextLabel.Text) or 0) + baseDamage
+		return gui
+	end
+
+	gui = gunFramework.DamageNumbers:Clone()
+	gui.Adornee = targetRootPart
+	gui.TextLabel.Text = baseDamage
+	gui.Parent = targetRootPart
+	gui:SetAttribute("Hits", 0)
+
+	return gui
+end
+
+local function positionDamageGui(gui, shooterRootPart, targetRootPart)
+	local shooterRotation = shooterRootPart.CFrame - shooterRootPart.Position
+	local offsetFromTarget = CFrame.new(targetRootPart.Position) * shooterRotation
+	local worldOffset = offsetFromTarget:ToWorldSpace(CFrame.new(2, 3, 0))
+
+	gui.StudsOffsetWorldSpace = targetRootPart.CFrame:ToObjectSpace(worldOffset).Position
+end
+
+local function scheduleDamageGuiFade(gui)
+	local startingHitCount = gui:GetAttribute("Hits")
+
+	task.delay(1, function()
+		if not gui.Parent then
+			return
+		end
+
+		-- The Hits attribute acts as a generation counter. If another hit arrived during the
+		-- delay, this callback is stale and must not destroy the refreshed damage display.
+		if gui:GetAttribute("Hits") ~= startingHitCount then
+			return
+		end
+
+		gui.Name = "Dead"
+		TweenService:Create(
+			gui.TextLabel,
+			TweenInfo.new(0.25, Enum.EasingStyle.Linear),
+			{TextTransparency = 1}
+		):Play()
+
+		task.delay(0.5, function()
+			if gui.Parent then
+				gui:Destroy()
+			end
+		end)
+	end)
+end
+
+local function showDamageFeedback(client, targetCharacter, hitPart, baseDamage, hitDistance)
+	if not IS_CLIENT then
+		return
+	end
+
+	local targetHumanoid = targetCharacter:FindFirstChildWhichIsA("Humanoid")
+	local targetRootPart = targetCharacter:FindFirstChild("HumanoidRootPart")
+	local shooterRootPart = client.Character:FindFirstChild("HumanoidRootPart")
+
+	if not targetHumanoid or not targetRootPart or not shooterRootPart then
+		return
+	end
+
+	local currentHealth = General.IsAlive(targetHumanoid)
+	if not currentHealth then
+		return
+	end
+
+	local hitSound, textColor = getHitFeedbackStyle(hitPart)
+	local gui = getOrCreateDamageGui(targetRootPart, baseDamage)
+
+	positionDamageGui(gui, shooterRootPart, targetRootPart)
+	gui.TextLabel.TextColor3 = textColor
+
+	local size = math.clamp(hitDistance / 20, 1.5, 30)
+	gui.Size = UDim2.fromScale(size, size)
+
+	TweenService:Create(
+		gui,
+		TweenInfo.new(0.1, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, 0, true),
+		{Size = UDim2.fromScale(size * 1.33, size * 1.25)}
+	):Play()
+
+	scheduleDamageGuiFade(gui)
+
+	-- Damage is applied through a remote/server path, so the target may still report its old
+	-- health on this frame. Comparing current health with the pending damage predicts whether
+	-- this hit will be lethal and lets the hit marker respond immediately without trusting the
+	-- client to authoritatively decide death.
+	client:Crosshair(hitPart, currentHealth <= baseDamage)
+	playClientSound(hitSound, true)
+end
+
+local function applyCharacterDamage(client, targetHumanoid, hitPart)
+	if IS_CLIENT then
+		client.Tool.GunStuff.Events.Damage:FireServer(targetHumanoid, hitPart)
+		return
+	end
+
+	General.Damage(client.Character, targetHumanoid, hitPart, client.Tool)
+end
+
+local function emitBloodEffects(client, targetCharacter, hitPosition)
+	runClientEffect("BloodSplat", {client.Character, targetCharacter, hitPosition})
+	dispatchEffect(
+		client.Tool,
+		client.Character,
+		"BloodSplat",
+		nil,
+		nil,
+		nil,
+		nil,
+		{client.Character, targetCharacter, hitPosition}
+	)
+end
+
+local function processCharacterHit(client, result, direction, bulletStrength, hitDistance, penetrationDepth)
+	local targetCharacter, targetHumanoid, targetPlayer = getTargetData(result.Instance)
+	if not targetCharacter then
+		return false
+	end
+
+	-- Returning true means the ray hit a character model even when damage is intentionally skipped.
+	-- This prevents friendly characters or missed NPC shots from being treated as walls afterward.
+	if isFriendlyTarget(client.Player, targetPlayer) then
+		return true
+	end
+
+	if not passesNpcHitChance(client) then
+		return true
+	end
+
+	local baseDamage = math.ceil(
+		General.GetDamage(result.Instance, client.Tool, client.Configuration)
+			* (bulletStrength / DEFAULT_BULLET_STRENGTH)
+	)
+
+	if baseDamage <= 0 then
+		return true
+	end
+
+	applyCharacterDamage(client, targetHumanoid, result.Instance)
+	showDamageFeedback(client, targetCharacter, result.Instance, baseDamage, hitDistance)
+	emitBloodEffects(client, targetCharacter, result.Position)
+
+	local resistance = getMaterialResistance("Player")
+	if bulletStrength < resistance then
+		return true
+	end
+
+	-- The complete model is ignored before the continuation ray so another limb from the same
+	-- target cannot consume penetration strength a second time at nearly the same position.
+	client:AddToParams(targetCharacter)
+	client:FireRay(
+		CFrame.new(result.Position),
+		direction,
+		getRemainingBulletStrength(bulletStrength, "Player"),
+		penetrationDepth + 1
+	)
+
+	return true
+end
+
+local function canPenetrateSurface(hitPart, bulletStrength)
+	if hitPart:GetAttribute("NoPenetration") then
+		return false
+	end
+
+	return bulletStrength >= getMaterialResistance(hitPart.Material.Name)
+end
+
+local function processSurfaceHit(client, result, direction, bulletStrength, penetrationDepth)
+	local hitPart = result.Instance
+	local holeTemplate = gunFramework.Parts.BulletMark
+
+	if canPenetrateSurface(hitPart, bulletStrength) then
+		holeTemplate = gunFramework.Parts.SoftWallHole
+
+		-- The current part is excluded before recursion. Without that exclusion, a ray beginning
+		-- exactly on the impact surface can immediately hit the same part again and never advance.
+		client:AddToParams(hitPart)
+		client:FireRay(
+			CFrame.new(result.Position),
+			direction,
+			getRemainingBulletStrength(bulletStrength, hitPart.Material.Name),
+			penetrationDepth + 1
+		)
+	end
+
+	local baseHoleCFrame = CFrame.new(result.Position, result.Position + result.Normal)
+	local adjustedHoleCFrame = baseHoleCFrame
+		* (holeTemplate:GetAttribute("CFrameAdjustment") or CFrame.new())
+
+	runClientEffect("BulletHole", {holeTemplate, hitPart, adjustedHoleCFrame})
+	dispatchEffect(
+		client.Tool,
+		client.Character,
+		"BulletHole",
+		nil,
+		nil,
+		{holeTemplate, hitPart, baseHoleCFrame}
+	)
+end
+
+local function buildRaycastParams(client)
+	client.Ignore = {client.Character}
+
+	local rooms = workspace:FindFirstChild("Rooms")
+	if rooms then
+		for _, room in ipairs(rooms:GetChildren()) do
+			local barriers = room:FindFirstChild("PathfindingBarriers")
+			if barriers then
+				table.insert(client.Ignore, barriers)
+			end
+		end
+	end
+
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.FilterDescendantsInstances = client.Ignore
+	client.Params = params
+end
+
+local function getSpreadRange(client)
+	if RunService:IsServer() then
+		local enemyConfigModule = client.Character:FindFirstChildWhichIsA("ModuleScript")
+		if not enemyConfigModule then
+			return 0, 0
+		end
+
+		local enemyConfig = require(enemyConfigModule)
+		return enemyConfig.MinBloom or 0, enemyConfig.MaxBloom or 0
+	end
+
+	if client.Configuration.ShootType == "Shotgun" then
+		local minSpread = getNumericValue(client.Configuration.MinSpread, 0)
+		local maxSpread = getNumericValue(client.Configuration.MaxSpread, minSpread)
+
+		if General.Aiming then
+			minSpread = getNumericValue(client.Configuration.AimMinSpread, minSpread)
+			maxSpread = getNumericValue(client.Configuration.AimMaxSpread, maxSpread)
+		end
+
+		return minSpread, maxSpread
+	end
+
+	local crosshair = client.Player
+		and client.Player.PlayerGui:FindFirstChild("RealCrosshair")
+		and client.Player.PlayerGui.RealCrosshair:FindFirstChild("Template")
+
+	if not crosshair then
+		return 0, 0
+	end
+
+	return 0, crosshair.Size.X.Scale * 5 * 0.95
+end
+
+local function getSpreadDirection(camera, minimumSpread, maximumSpread)
+	if maximumSpread < minimumSpread then
+		minimumSpread, maximumSpread = maximumSpread, minimumSpread
+	end
+
+	local directionCFrame = CFrame.lookAt(Vector3.zero, camera.CFrame.LookVector)
+	local radialRotation = CFrame.fromOrientation(0, 0, math.rad(RNG:NextNumber(0, 360)))
+	local spread = RNG:NextNumber(minimumSpread, maximumSpread)
+	local spreadAngle = CFrame.fromOrientation(math.rad(spread), 0, 0)
+
+	-- A random rotation around the forward axis chooses a direction on the spread circle, then
+	-- the angular offset moves outward by the selected spread amount. This avoids biasing shots
+	-- toward only horizontal or vertical directions.
+	return (directionCFrame * radialRotation * spreadAngle).LookVector
+end
+
+local function fireProjectiles(client)
+	local minimumSpread, maximumSpread = getSpreadRange(client)
+
+	for _ = 1, client.Configuration.BulletsPerShot do
+		local direction = getSpreadDirection(client.Camera, minimumSpread, maximumSpread)
+		client:FireRay(nil, direction)
+	end
+end
+
+local function updateCrosshairBloom(client)
+	if not CrosshairModule then
+		return
+	end
+
+	local bloomStrength = General.Aiming
+		and client.Configuration.AimSpreadStrength
+		or client.Configuration.HipfireSpreadStrength
+
+	CrosshairModule.CrosshairDistance(bloomStrength)
+end
+
+local function playShotAnimation(client)
+	General.PlayAnimationSet(client.Tracks, "Inspect", false)
+
+	if General.Aiming then
+		General.PlayAnimationSet(client.Tracks, "Shoot", true)
+		return
+	end
+
+	General.PlayAnimationSet(client.Tracks, "HipFireShoot", true)
+end
+
+local function emitShotPresentation(client)
+	local tool = client.Tool
+	local character = client.Character
+
+	playClientSound(tool.Handle.Audios.Gunshot, true)
+	dispatchEffect(tool, character, "Sounds", nil, nil, nil, {tool.Handle.Audios.Gunshot, true})
+
+	runClientEffect("Particles", {tool, client.Configuration.BulletsPerShot})
+	dispatchEffect(tool, character, "Particles", nil, {tool, client.Configuration.BulletsPerShot})
+end
+
+local function stopShootShake(client)
+	if not IS_CLIENT or not client.ShootShakeKey then
+		return
+	end
+
+	RunService:UnbindFromRenderStep(client.ShootShakeKey)
+	General.ShootShakeOffset.Value = Vector3.zero
+end
+
+local function startShootShake(client)
+	if not IS_CLIENT then
+		return
+	end
+
+	client.ShakeElapsed = 0
+	RunService:UnbindFromRenderStep(client.ShootShakeKey)
+
+	RunService:BindToRenderStep(client.ShootShakeKey, 1, function(deltaTime)
+		client.ShakeElapsed += deltaTime
+
+		if client.ShakeElapsed <= 0.04 then
+			local currentTime = os.clock()
+			local bobbleX = math.cos(currentTime * 30) * 0.4
+			local bobbleY = math.abs(math.sin(currentTime * 4)) * 0.3
+			local targetOffset = Vector3.new(bobbleX, bobbleY - 0.15, 0)
+			local alpha = 1 - math.exp(-18 * deltaTime)
+
+			General.ShootShakeOffset.Value = General.ShootShakeOffset.Value:Lerp(targetOffset, alpha)
+			return
+		end
+
+		local alpha = 1 - math.exp(-16 * deltaTime)
+		General.ShootShakeOffset.Value = General.ShootShakeOffset.Value:Lerp(Vector3.zero, alpha)
+
+		-- Comparing an interpolated vector to exact zero can fail indefinitely because lerp
+		-- approaches its target asymptotically. A small magnitude threshold gives the effect a
+		-- deterministic stopping point and prevents a render-step callback from leaking forever.
+		if General.ShootShakeOffset.Value.Magnitude > 0.001 then
+			return
+		end
+
+		stopShootShake(client)
+	end)
+end
+
+local function randomBetween(minimum, maximum)
+	return RNG:NextNumber(minimum, maximum)
+end
+
+local function applyRecoil(client)
+	local configuration = client.Configuration
+	local horizontalDirection = RNG:NextNumber() > configuration.HorizontalStrength and 1 or -1
+	local horizontalRecoil = randomBetween(configuration.HorizontalMin, configuration.HorizontalMax)
+		* horizontalDirection
+	local verticalRecoil = randomBetween(configuration.VerticalMin, configuration.VerticalMax)
+
+	General.Recoil.Value = Vector3.new(horizontalRecoil, verticalRecoil, 0)
+end
+
+local function handleSniperPostShot(client)
+	if client.Configuration.ShootType ~= "Sniper" then
+		return
+	end
+
+	task.spawn(function()
+		client.AimDebounce = true
+		client:Unaim()
+		task.wait(client.CurrentShootDebounce)
+		client.AimDebounce = false
+
+		if not IS_CLIENT or not client.Tool.Parent then
+			return
+		end
+
+		if UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton2) then
+			client:Aim()
+		end
+	end)
+end
+
+local function handleEmptyMagazine(client)
+	if client.MadeClickSoundForNoAmmo and isAutomaticShootType(client.Configuration.ShootType) then
+		return
+	end
+
+	task.spawn(function()
+		client.MadeClickSoundForNoAmmo = true
+		playClientSound(client.Tool.Handle.Audios.NoAmmo, true)
+		dispatchEffect(
+			client.Tool,
+			client.Character,
+			"Sounds",
+			nil,
+			nil,
+			nil,
+			{client.Tool.Handle.Audios.NoAmmo, true}
+		)
+		client:Reload()
+		client.MadeClickSoundForNoAmmo = false
+	end)
+end
+
+local function canFire(client)
+	if client.Reloading then
+		return false
+	end
+
+	if not General.IsAlive(client.Character.Humanoid) then
+		return false
+	end
+
+	if client.ShootDebounce and client.Configuration.ShootType ~= "Shotgun" then
+		return false
+	end
+
+	return true
+end
+
+local function finishShotCooldown(client)
+	if client.Configuration.ShootType ~= "Shotgun" then
+		task.wait(client.CurrentShootDebounce)
+	end
+
+	client.ShootDebounce = false
+	General.Shooting = false
+end
+
+local function loadTracks(client)
+	local trackNames = {
+		"Equip",
+		"Unequip",
+		"Idle",
+		"Aim",
+		"Shoot",
+		"Reload",
+		"HipFireShoot",
+		"Inspect",
+		"Jump",
+		"Sprint",
+	}
+
+	local tracks = {}
+
+	for _, animationName in ipairs(trackNames) do
+		local normalTrack, armModelTrack = client:GetTracks(animationName)
+		tracks[animationName .. "Track"] = normalTrack
+		tracks["ArmModel" .. animationName .. "Track"] = armModelTrack
+	end
+
+	if RunService:IsServer() then
+		tracks.WalkTrack = General.LoadTrack(
+			ReplicatedStorage.Animations.Walk,
+			client.Character.Humanoid
+		)
+	end
+
+	return tracks
+end
+
+local function setTrackPriority(tracks, newPriority)
+	for _, track in ipairs(tracks) do
+		if track then
+			track.Priority = newPriority
+		end
+	end
+end
+
+local function configureMinigun(client)
+	if client.Configuration.ShootType ~= "Minigun" then
+		return
+	end
+
+	local barrel = client.Tool.Model.Barrel
+	local angularVelocity = ReplicatedStorage.AngularVelocity:Clone()
+	angularVelocity.Parent = barrel
+
+	local attachment = Instance.new("Attachment")
+	attachment.Parent = barrel
+	angularVelocity.Attachment0 = attachment
+	angularVelocity.MaxTorque = 0
+
+	client.MinigunVelocity = angularVelocity
+	client.CurrentShootDebounce = MINIGUN_START_DEBOUNCE
+end
+
+local function spinUpMinigun(client)
+	if not client.MinigunVelocity then
+		return
+	end
+
+	client.MinigunVelocity.MaxTorque = MINIGUN_MAX_TORQUE
+
+	task.spawn(function()
+		while client.HoldingTrigger and client.CurrentShootDebounce > client.Configuration.ShootDebounce do
+			client.CurrentShootDebounce = math.max(
+				client.Configuration.ShootDebounce,
+				client.CurrentShootDebounce - MINIGUN_DEBOUNCE_STEP
+			)
+			task.wait(0.1)
+		end
+	end)
+end
+
+local function spinDownMinigun(client)
+	if not client.MinigunVelocity then
+		return
+	end
+
+	client.MinigunVelocity.MaxTorque = 0
+
+	task.spawn(function()
+		while not client.HoldingTrigger and client.CurrentShootDebounce < MINIGUN_START_DEBOUNCE do
+			client.CurrentShootDebounce = math.min(
+				MINIGUN_START_DEBOUNCE,
+				client.CurrentShootDebounce + MINIGUN_DEBOUNCE_STEP
+			)
+			task.wait(0.1)
+		end
+	end)
+end
+
+local function bindInputActions(client)
+	if not IS_CLIENT then
+		return
+	end
+
+	ContextActionService:BindAction(
+		"Inspect",
+		function(_, state)
+			if state ~= Enum.UserInputState.Begin or General.Aiming then
+				return
+			end
+
+			General.PlayAnimationSet(client.Tracks, "Inspect", true)
+		end,
+		false,
+		Enum.KeyCode.F
+	)
+
+	ContextActionService:BindAction(
+		"ShootClick",
+		function(_, state)
+			if state == Enum.UserInputState.Begin then
+				client:StartHold()
+				return
+			end
+
+			if state == Enum.UserInputState.End then
+				client:EndHold()
+			end
+		end,
+		false,
+		Enum.UserInputType.MouseButton1
+	)
+
+	ContextActionService:BindAction(
+		"AimState",
+		function(_, state)
+			if state == Enum.UserInputState.Begin then
+				client:Aim()
+				return
+			end
+
+			if state == Enum.UserInputState.End then
+				client:Unaim()
+			end
+		end,
+		false,
+		Enum.UserInputType.MouseButton2
+	)
+
+	ContextActionService:BindAction(
+		"Reload",
+		function(_, state)
+			if state == Enum.UserInputState.Begin then
+				client:Reload()
+			end
+		end,
+		false,
+		Enum.KeyCode.R
+	)
+end
+
+local function unbindInputActions()
+	if not IS_CLIENT then
+		return
+	end
+
+	ContextActionService:UnbindAction("Inspect")
+	ContextActionService:UnbindAction("ShootClick")
+	ContextActionService:UnbindAction("AimState")
+	ContextActionService:UnbindAction("Reload")
+end
+
+function Gun.GiveAmmo(ammoType, amount)
+	Gun.Ammo[ammoType] += amount
+end
+
 function ClientTemplate:Aim()
-	if not self.AimDebounce and not self.Reloading and General.IsAlive(self.Character.Humanoid) then
-
-		General.PlayAnimationSet(self.Tracks, "Inspect", false)
-		General.PlayAnimationSet(self.Tracks, "Aim", true, .6)
-
-		local Tool = self.Tool
-		local Configuration = require(Tool.GunStuff.Configuration)
-
-		if CustomCamera then
-			CustomCamera.SensitivityMultiplier = Configuration.AimSensitivityMultiplier
-		end
-
-
-		ClientSound(Tool.Handle.Audios.Aim, true)
-		General.Aiming = true
-
-		if RunService:IsClient() and Configuration.ShootType == "Sniper" then
-			self.Player.PlayerGui.Sniper.Enabled = true
-		end
+	if self.AimDebounce or self.Reloading then
+		return
 	end
+
+	if not General.IsAlive(self.Character.Humanoid) then
+		return
+	end
+
+	General.PlayAnimationSet(self.Tracks, "Inspect", false)
+	General.PlayAnimationSet(self.Tracks, "Aim", true, 0.6)
+
+	if CustomCamera then
+		CustomCamera.SensitivityMultiplier = self.Configuration.AimSensitivityMultiplier
+	end
+
+	playClientSound(self.Tool.Handle.Audios.Aim, true)
+	General.Aiming = true
+
+	if not IS_CLIENT or self.Configuration.ShootType ~= "Sniper" or not self.Player then
+		return
+	end
+
+	self.Player.PlayerGui.Sniper.Enabled = true
 end
 
-
--- Leaves the aiming state, restores default camera sensitivity, and disables sniper scope UI.
 function ClientTemplate:Unaim()
 	General.PlayAnimationSet(self.Tracks, "Aim", false)
 
@@ -199,801 +913,437 @@ function ClientTemplate:Unaim()
 		CustomCamera.SensitivityMultiplier = 1
 	end
 
-	local Tool = self.Tool
-	local Configuration = require(Tool.GunStuff.Configuration)
-	ClientSound(Tool.Handle.Audios.Unaim, true)
+	playClientSound(self.Tool.Handle.Audios.Unaim, true)
 	General.Aiming = false
 
-	if RunService:IsClient() and Configuration.ShootType == "Sniper" then
+	if not IS_CLIENT or self.Configuration.ShootType ~= "Sniper" or not self.Player then
+		return
+	end
+
+	self.Player.PlayerGui.Sniper.Enabled = false
+end
+
+function ClientTemplate:Crosshair(bodyPart, killed)
+	if not IS_CLIENT or not self.Player then
+		return
+	end
+
+	task.spawn(function()
+		if self.MainFrame then
+			self.MainFrame:Destroy()
+		end
+
+		local crosshairGui = self.Player.PlayerGui:WaitForChild("Crosshair")
+		local mainFrame = crosshairGui.Template:Clone()
+		self.MainFrame = mainFrame
+		mainFrame.Parent = crosshairGui
+
+		if killed then
+			setFrameProperty(mainFrame, "BackgroundColor3", Color3.fromRGB(163, 0, 0))
+		elseif General.HeadCheck(bodyPart) then
+			setFrameProperty(mainFrame, "BackgroundColor3", Color3.fromRGB(182, 185, 4))
+		end
+
+		mainFrame.Size = CROSSHAIR_START_SIZE
+		mainFrame.Visible = true
+
+		TweenService:Create(
+			mainFrame,
+			TweenInfo.new(0.08, Enum.EasingStyle.Sine),
+			{Size = CROSSHAIR_PEAK_SIZE, Rotation = RNG:NextInteger(-10, 10)}
+		):Play()
+
+		task.wait(0.08)
+
+		TweenService:Create(
+			mainFrame,
+			TweenInfo.new(0.04, Enum.EasingStyle.Sine),
+			{Size = CROSSHAIR_MIN_SIZE}
+		):Play()
+
+		task.wait(0.5)
+
+		if mainFrame.Parent then
+			setFrameProperty(mainFrame, "Transparency", 1)
+		end
+	end)
+end
+
+function ClientTemplate:AddToParams(toAdd)
+	if not self.Ignore then
+		self.Ignore = {self.Character}
+	end
+
+	table.insert(self.Ignore, toAdd)
+
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.FilterDescendantsInstances = self.Ignore
+	self.Params = params
+end
+
+function ClientTemplate:FireRay(origin, direction, bulletStrength, penetrationDepth)
+	bulletStrength = bulletStrength or DEFAULT_BULLET_STRENGTH
+	penetrationDepth = penetrationDepth or 0
+
+	if bulletStrength <= 0 or penetrationDepth > MAX_PENETRATIONS then
+		return
+	end
+
+	direction = direction or self.Camera.CFrame.LookVector
+	local rayOrigin = origin or self.Camera.CFrame
+	local trailOrigin = origin or self.Tool.Handle.FirePoint.WorldCFrame
+	local result = workspace:Raycast(rayOrigin.Position, direction * MAX_RAY_DISTANCE, self.Params)
+	local endPosition = result and result.Position or rayOrigin.Position + direction * MAX_RAY_DISTANCE
+
+	runClientEffect("Trail", {trailOrigin, endPosition})
+	dispatchEffect(self.Tool, self.Character, "Trail", {trailOrigin, endPosition})
+
+	if not result then
+		return
+	end
+
+	local hitDistance = (trailOrigin.Position - result.Position).Magnitude
+	local hitCharacter = processCharacterHit(
+		self,
+		result,
+		direction,
+		bulletStrength,
+		hitDistance,
+		penetrationDepth
+	)
+
+	if hitCharacter then
+		return
+	end
+
+	processSurfaceHit(self, result, direction, bulletStrength, penetrationDepth)
+end
+
+function ClientTemplate:Fire()
+	if not canFire(self) then
+		return
+	end
+
+	General.Shooting = true
+	self.ShootDebounce = true
+
+	if Gun.CurrentBullets <= 0 then
+		handleEmptyMagazine(self)
+		finishShotCooldown(self)
+		return
+	end
+
+	buildRaycastParams(self)
+	fireProjectiles(self)
+	updateCrosshairBloom(self)
+	playShotAnimation(self)
+	emitShotPresentation(self)
+	startShootShake(self)
+	applyRecoil(self)
+	handleSniperPostShot(self)
+
+	Gun.CurrentBullets -= 1
+	finishShotCooldown(self)
+end
+
+function ClientTemplate:Reload(actionName, state)
+	if actionName and (not state or state.Name ~= "Begin") then
+		return
+	end
+
+	if self.Reloading then
+		return
+	end
+
+	if not General.IsAlive(self.Character.Humanoid) then
+		return
+	end
+
+	local ammoType = self.Configuration.AmmoType
+	local reserveAmmo = Gun.Ammo[ammoType] or 0
+	if reserveAmmo <= 0 then
+		return
+	end
+
+	local missingBullets = self.Configuration.PerMag - Gun.CurrentBullets
+	if missingBullets <= 0 then
+		return
+	end
+
+	local bulletsToAdd = math.min(missingBullets, reserveAmmo)
+	self.Reloading = true
+
+	playClientSound(self.Tool.Handle.Audios.Reload, true)
+	dispatchEffect(
+		self.Tool,
+		self.Character,
+		"Sounds",
+		nil,
+		nil,
+		nil,
+		{self.Tool.Handle.Audios.Reload, true}
+	)
+
+	General.PlayAnimationSet(self.Tracks, "Reload", true)
+
+	if General.Aiming then
+		self:Unaim()
+	end
+
+	local reloadTrack = self.Tracks.ReloadTrack
+	if not reloadTrack then
+		self.Reloading = false
+		return
+	end
+
+	reloadTrack.Stopped:Wait()
+
+	-- Unequipping cancels Reloading while this function is yielded on the animation. Re-checking
+	-- the flag here prevents an unequipped weapon from adding ammunition after the reload was cancelled.
+	if not self.Reloading then
+		return
+	end
+
+	Gun.CurrentBullets += bulletsToAdd
+	Gun.Ammo[ammoType] -= bulletsToAdd
+	self.Reloading = false
+
+	if not IS_CLIENT then
+		return
+	end
+
+	if UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton2) then
+		self:Aim()
+	end
+end
+
+function ClientTemplate:GetTracks(animationName)
+	local animation = self.Tool.GunStuff.Animations:FindFirstChild(animationName)
+	if not animation or animation.AnimationId == "" then
+		return nil, nil
+	end
+
+	local normalTrack = self.Character.Humanoid.Animator:LoadAnimation(animation)
+	local armModelTrack
+
+	if IS_CLIENT then
+		local armModel = workspace:FindFirstChild("ArmModel")
+		if armModel and armModel:FindFirstChild("Humanoid") then
+			armModelTrack = armModel.Humanoid.Animator:LoadAnimation(animation)
+		end
+	end
+
+	return normalTrack, armModelTrack
+end
+
+function ClientTemplate:StartAutomaticLoop()
+	self.AutomaticLoopVersion += 1
+	local loopVersion = self.AutomaticLoopVersion
+
+	-- Automatic fire is a gameplay loop rather than rendering work, so it should not be bound to
+	-- RenderStep. The version token invalidates older loops if input is rebound or restarted quickly.
+	task.spawn(function()
+		while self.HoldingTrigger and self.Equipped and self.AutomaticLoopVersion == loopVersion do
+			self:Fire()
+			task.wait()
+		end
+	end)
+end
+
+function ClientTemplate:FireBurst()
+	if self.BurstDebounce then
+		return
+	end
+
+	self.BurstDebounce = true
+
+	task.spawn(function()
+		for _ = 1, 3 do
+			if not self.HoldingTrigger or not self.Equipped then
+				break
+			end
+
+			self:Fire()
+			task.wait(self.CurrentShootDebounce)
+		end
+
+		task.wait(self.Configuration.FiringDebounce)
+		self.BurstDebounce = false
+	end)
+end
+
+function ClientTemplate:FireShotgun()
+	if self.ShotgunDebounce then
+		return
+	end
+
+	self.ShotgunDebounce = true
+
+	task.spawn(function()
+		self:Fire()
+		task.wait(self.CurrentShootDebounce)
+		self.ShotgunDebounce = false
+	end)
+end
+
+function ClientTemplate:StartHold()
+	self.HoldingTrigger = true
+
+	if not self.Equipped then
+		return
+	end
+
+	local shootType = self.Configuration.ShootType
+
+	if isAutomaticShootType(shootType) then
+		self.MadeClickSoundForNoAmmo = false
+		self:StartAutomaticLoop()
+
+		if shootType == "Minigun" then
+			spinUpMinigun(self)
+		end
+		return
+	end
+
+	if shootType == "Burst" then
+		self:FireBurst()
+		return
+	end
+
+	if shootType == "Shotgun" then
+		self:FireShotgun()
+		return
+	end
+
+	self:Fire()
+end
+
+function ClientTemplate:EndHold()
+	self.HoldingTrigger = false
+	self.AutomaticLoopVersion += 1
+
+	if self.Configuration.ShootType == "Minigun" then
+		spinDownMinigun(self)
+	end
+end
+
+function ClientTemplate:OnEquipped()
+	if self.ArmModel then
+		self.ArmModel:SetAttribute("Active", true)
+	end
+
+	Gun.CurrentBullets = self.StoredBullets
+	playClientSound(self.Tool.Handle.Audios.Equip, true)
+	General.PlayAnimationSet(self.Tracks, "Idle", true, 0.01)
+	General.PlayAnimationSet(self.Tracks, "Equip", true, 0.01)
+
+	self.Equipping = true
+
+	local equipTrack = self.Tracks.EquipTrack
+	if equipTrack then
+		equipTrack.Stopped:Wait()
+	end
+
+	if not self.Equipping then
+		return
+	end
+
+	self.Equipping = false
+	self.Equipped = true
+	bindInputActions(self)
+
+	if not IS_CLIENT then
+		return
+	end
+
+	if UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton2) then
+		self:Aim()
+	end
+
+	if UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton1)
+		and isAutomaticShootType(self.Configuration.ShootType)
+	then
+		self:StartHold()
+	end
+end
+
+function ClientTemplate:OnUnequipped()
+	if self.ArmModel then
+		self.ArmModel:SetAttribute("Active", false)
+	end
+
+	self.StoredBullets = Gun.CurrentBullets
+	self.Equipping = false
+	self.Equipped = false
+	self.Reloading = false
+
+	self:EndHold()
+	stopShootShake(self)
+	unbindInputActions()
+
+	playClientSound(self.Tool.Handle.Audios.Reload, false)
+	dispatchEffect(
+		self.Tool,
+		self.Character,
+		"Sounds",
+		nil,
+		nil,
+		nil,
+		nil,
+		{self.Tool.Handle.Audios.Reload}
+	)
+
+	for trackName, track in pairs(self.Tracks) do
+		if track then
+			General.PlayAnimation(track, false, nil, trackName)
+		end
+	end
+
+	General.PlayAnimationSet(self.Tracks, "Unequip", true)
+	General.Aiming = false
+	self:Unaim()
+
+	task.wait()
+
+	local newTool = self.Character:FindFirstChildWhichIsA("Tool")
+	if not newTool then
+		playClientSound(self.Tool.Handle.Audios.Unequip, true)
+		return
+	end
+
+	if IS_CLIENT and self.Configuration.ShootType == "Sniper" and self.Player then
 		self.Player.PlayerGui.Sniper.Enabled = false
 	end
 end
 
-
-
--- Displays short-lived hit feedback. Kill hits use red, headshots use yellow, and ordinary
--- body hits keep the default crosshair color. The marker is recreated so overlapping hits
--- restart the animation cleanly instead of continuing an old tween.
-function ClientTemplate:Crosshair(BodyPart, Killed)
-
-
-	if RunService:IsClient() then
-		coroutine.wrap(function()
-			if self.MainFrame then
-				self.MainFrame:Destroy()
-			end
-			
-			local Player = self.Player
-			self.MainFrame = Player.PlayerGui:WaitForChild("Crosshair").Template:Clone()
-			self.MainFrame.Parent = Player.PlayerGui.Crosshair
-
-			local function ChangeProperty(PropertyName, Value)
-				for i, v in pairs(self.MainFrame:GetChildren()) do
-					if v:IsA("Frame") then
-						v[PropertyName] = Value
-					end
-				end
-			end
-
-			if Killed then
-				ChangeProperty("BackgroundColor3", Color3.fromRGB(163, 0, 0))
-			elseif General.HeadCheck(BodyPart) then
-				ChangeProperty("BackgroundColor3", Color3.fromRGB(182, 185, 4))
-			end
-
-
-			self.MainFrame.Size = START_SIZE
-			self.MainFrame.Visible = true
-			TweenService:Create(self.MainFrame, TweenInfo.new(.08, Enum.EasingStyle.Sine), {Size = PEAK_SIZE}):Play()
-			TweenService:Create(self.MainFrame, TweenInfo.new(.08, Enum.EasingStyle.Sine), {Rotation = math.random(-10,10)}):Play()
-			task.wait(.08)
-			TweenService:Create(self.MainFrame, TweenInfo.new(.04, Enum.EasingStyle.Sine), {Size = MIN_SIZE}):Play()
-			task.wait(.5)
-
-			ChangeProperty("Transparency", 1)
-		end)()
-	end
-end
-
-
--- Adds an Instance to the raycast ignore list and rebuilds RaycastParams.
--- This is important for penetration: after a bullet passes through something, the next
--- recursive ray must ignore that same object or it could immediately hit it again.
-function ClientTemplate:AddToParams(ToAdd)
-	self.Params = RaycastParams.new()
-	table.insert(self.Ignore, ToAdd)
-	self.Params.FilterDescendantsInstances = self.Ignore
-end
-
-
--- Casts one bullet segment and resolves damage, penetration, trails, and impact effects.
--- Origin and Direction are optional so the initial shot can use the camera automatically.
--- BulletHealth tracks remaining penetration strength and decreases each time the shot passes
--- through a character or penetrable surface.
-function ClientTemplate:FireRay(Origin, Direction, BulletHealth)
-	local Camera = self.Camera
-	local Character = self.Character
-	local HRP = Character.HumanoidRootPart
-	local Tool = self.Tool
-
-	local Configuration = require(Tool.GunStuff.Configuration)
-	
-	BulletHealth = BulletHealth or 100
-	Direction = Direction or Camera.CFrame.LookVector	
-	local RayOrigin = Origin or Camera.CFrame
-	local TrailOrigin = Origin or Tool.Handle.FirePoint.WorldCFrame
-
-	-- A maximum distance of 1000 studs is used for the current bullet segment. If no surface
-	-- is hit, the trail still extends to the calculated endpoint so missed shots remain visible.
-	local Result = workspace:Raycast(RayOrigin.Position, Direction * 1000, self.Params)
-
-	local EndPosition = Result and Result.Position or RayOrigin.Position + Direction * 1000
-
-
-
-	ClientEffects(GunEffects, "Trail", {TrailOrigin, EndPosition})
-	Effects(Tool, Character, {"Trail", {TrailOrigin, EndPosition}})
-
-	if Result then
-		local Distance = (TrailOrigin.Position - Result.Position).Magnitude
-
-		local Hit = Result.Instance		
-		-- A hit part may belong to a character model, so walk up the ancestry tree and then
-		-- confirm that the model actually contains a Humanoid before treating it as a character.
-		local OtherCharacter = Hit:FindFirstAncestorWhichIsA("Model")
-		local IsCharacter = false
-
-		if OtherCharacter then					
-			local OtherHumanoid = OtherCharacter:FindFirstChildWhichIsA("Humanoid")
-			local OtherPlayer = game.Players:GetPlayerFromCharacter(OtherCharacter)
-			if OtherHumanoid then
-				IsCharacter = true
-
-				local Player = self.Player
-				local EnemyConfig = not Player and require(Character:FindFirstChildWhichIsA("ModuleScript"))
-				-- Player-fired shots always use the exact ray result. NPC shots can intentionally miss
-				-- according to their configured hit chance, which separates aiming difficulty from raycasting.
-				local HitChance = Player or (math.random() < EnemyConfig.HitChance)
-		
-				-- Damage is allowed for NPC targets, unteamed players, NPC shooters, or enemy-team players.
-				-- Combined with HitChance, this prevents friendly-fire damage while supporting NPC accuracy.
-				if (not OtherPlayer or not OtherPlayer.Team or not Player or OtherPlayer.Team ~= Player.Team) and HitChance then				
-					local Sound = game.ReplicatedStorage.GunFramework.Sounds.Bodyshot	
-					local Color = Color3.fromRGB(255, 255, 255)
-
-					if General.HeadCheck(Hit) then
-						Sound = game.ReplicatedStorage.GunFramework.Sounds.Headshot	
-						Color = Color3.fromRGB(255, 255, 0)
-					end
-					-- Remaining penetration strength also scales damage. A bullet that has already passed through
-					-- several targets or surfaces therefore becomes less damaging instead of retaining full power.
-					local BaseDamage = math.ceil(General.GetDamage(Hit, Tool, Configuration) * (BulletHealth/100))
-					if BaseDamage > 0 then
-						-- Continue the same shot beyond the character. The whole model is ignored on the next ray so
-						-- another body part from the same target cannot immediately consume penetration again.
-						self:AddToParams(OtherCharacter)
-						self:FireRay(CFrame.new(Result.Position), nil, GetHealth(BulletHealth, "Player"))
-
-						if RunService:IsClient() then
-							Tool.GunStuff.Events.Damage:FireServer(OtherHumanoid, Hit)
-						else
-							General.Damage(Character, OtherHumanoid, Hit, Tool)
-						end
-
-						if RunService:IsClient() and OtherCharacter:FindFirstChild("HumanoidRootPart") and General.IsAlive(OtherHumanoid) then
-							local OtherHRP = OtherCharacter.HumanoidRootPart
-							local Gui = OtherHRP:FindFirstChild("DamageNumbers")
-							if not Gui then
-								Gui = game.ReplicatedStorage.GunFramework.DamageNumbers:Clone()
-								Gui.Adornee = OtherHRP						
-								Gui.TextLabel.Text = BaseDamage			
-								Gui.Parent = OtherHRP
-								Gui:SetAttribute("Hits", 0)
-							else										
-								Gui:SetAttribute("Hits", Gui:GetAttribute("Hits") + 1)
-								Gui.TextLabel.Text = tonumber(Gui.TextLabel.Text) + BaseDamage		
-							end
-
-							-- Position the damage-number billboard relative to the shooter's facing direction so it stays
-							-- offset from the target instead of appearing directly inside the character model.
-							local HRPAngle = HRP.CFrame - HRP.Position
-							local HRPCFrameTurned = CFrame.new(OtherHRP.Position) * HRPAngle
-							local a = HRPCFrameTurned:ToWorldSpace(CFrame.new(2, 3, 0))
-							Gui.StudsOffsetWorldSpace = (OtherHRP.CFrame:ToObjectSpace(a)).Position
-
-							Gui.TextLabel.TextColor3 = Color
-							local Size = math.clamp(Distance/20, 1.5, 30)
-							Gui.Size = UDim2.fromScale(Size, Size)
-							TweenService:Create(Gui, TweenInfo.new(.1, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, 0, true), {Size = UDim2.fromScale(Size * 1.33, Size * 1.25)}):Play()
-
-							coroutine.wrap(function()
-								local StartHits = Gui:GetAttribute("Hits")
-								task.wait(1)
-								if StartHits == Gui:GetAttribute("Hits") then
-									Gui.Name = "Dead"
-									TweenService:Create(Gui.TextLabel, TweenInfo.new(.25, Enum.EasingStyle.Linear), {TextTransparency = 1}):Play()
-									task.wait(.5)
-									Gui:Destroy()
-								end
-							end)()
-							local Health = General.IsAlive(OtherHumanoid)
-
-							-- Damage replication is slightly delayed, so the Humanoid may still report its pre-hit health
-							-- at this moment. Compare current health against the pending damage to predict whether this
-							-- hit will be lethal and choose the correct hit-marker color immediately.
-							self:Crosshair(Hit, Health <= BaseDamage) 
-
-							Effects(Tool, Character, {"Sounds", nil, nil, nil, {Tool.Handle.Audios.NoAmmo, true}})	
-							ClientSound(Sound, true)
-						end
-
-						ClientEffects(GunEffects, "BloodSplat", {Character, OtherCharacter, Result.Position})
-						Effects(Tool, Character, {"BloodSplat", nil, nil, nil, nil, {Character, OtherCharacter, Result.Position}})
-					end
-				end
-			end
-		end
-
-		-- Non-character impacts may either stop the bullet or allow it to continue through the surface,
-		-- depending on the material resistance table and the optional NoPenetration attribute.
-		if not IsCharacter then	
-			local Hole = game.ReplicatedStorage.GunFramework.Parts.BulletMark
-
-			local MaterialHealth = MaterialHealths[Result.Instance.Material.Name]
-			-- Penetration is allowed when the surface is not explicitly blocked and the bullet has enough
-			-- remaining strength to overcome that material. Unknown materials use GetHealth's fallback cost.
-			if not Hit:GetAttribute("NoPenetration") and (not MaterialHealth or BulletHealth >= MaterialHealth) then
-				Hole = game.ReplicatedStorage.GunFramework.Parts.SoftWallHole
-				
-				self:AddToParams(Result.Instance)
-				self:FireRay(CFrame.new(Result.Position), Direction, GetHealth(BulletHealth, Result.Instance.Material.Name))
-			end
-
-			-- Orient the impact mark along the surface normal so it sits flush against the hit face.
-			local HoleCFrame = CFrame.new(Result.Position, Result.Position + Result.Normal) * (Hole:GetAttribute("CFrameAdjustment") or CFrame.new(0, 0, 0))
-			ClientEffects(GunEffects, "BulletHole", {Hole, Hit, HoleCFrame})
-			Effects(Tool, Character, {"BulletHole", nil, nil, {Hole, Hit, CFrame.new(Result.Position, Result.Position + Result.Normal)}})
-		end	
-	end
-end
-
-
-
--- Resolves one trigger-driven firing attempt. This function prepares raycast filters, calculates
--- spread, fires every pellet, plays presentation effects, applies recoil, and consumes ammo.
-function ClientTemplate:Fire()
-
-	local Tool = self.Tool
-	local Configuration = require(Tool.GunStuff.Configuration)
-	
-
-	local Character = self.Character
-	local Humanoid = Character.Humanoid
-	if (not self.ShootDebounce or Configuration.ShootType == "Shotgun") and not self.Reloading and General.IsAlive(Humanoid) then
-
-		General.Shooting = true
-		self.ShootDebounce = true
-
-		if Gun.CurrentBullets > 0 then
-
-			-- Build a fresh ignore list for each trigger event. The shooter and room pathfinding barriers
-			-- are excluded so bullets do not collide with the firing character or AI-only navigation geometry.
-			self.Params = RaycastParams.new()
-			self.Ignore = {self.Character}
-			for i, Room in pairs(workspace.Rooms:GetChildren()) do
-				if Room:FindFirstChild("PathfindingBarriers") then
-					table.insert(self.Ignore, Room.PathfindingBarriers)
-				end
-			end
-			self.Params.FilterDescendantsInstances = self.Ignore
-
-			local Min
-			local Max
-			
-			if RunService:IsServer() then
-				--local DirectionCFrame = CFrame.new(Vector3.new(), self.Camera.CFrame.LookVector)
-
-				local EnemyConfig = require(Character:FindFirstChildWhichIsA("ModuleScript"))
-				Min = EnemyConfig.MinBloom
-				Max = EnemyConfig.MaxBloom
-
-				if General.Aiming and Configuration.ShootType == "Shotgun" then
-					--Min =  Configuration.AimMinSpread.Value
-					--Max = Configuration.AimMaxSpread.Value
-				end
-			else
-				if Configuration.ShootType == "Shotgun" then
-					--Min = Configuration.MinSpread.Value
-					--Max = Configuration.MaxSpread.Value
-
-					--if General.Aiming then
-					--	Min = Configuration.AimMinSpread.Value
-					--	Max = Configuration.AimMaxSpread.Value
-					--end
-				else
-					Min = 0
-					Max = (self.Player.PlayerGui.RealCrosshair.Template.Size.X.Scale * 5) * .95
-				end	
-			end
-
-			-- Each pellet starts from the camera look direction. A random roll chooses a direction around
-			-- the center axis, then SpreadAngle pushes the pellet outward by a random amount inside the bloom range.
-			for i = 1, Configuration.BulletsPerShot do	
-				local DirectionCFrame = CFrame.new(Vector3.new(), self.Camera.CFrame.LookVector)
-				local SpreadDirection = CFrame.fromOrientation(0, 0, math.rad(math.random(0, 360)))
-				local Spread = math.random(Min * 10, Max * 10)/10 
-				--Spread *= .2
-				local SpreadAngle = CFrame.fromOrientation(math.rad(Spread), 0, 0)
-				local Direction = (DirectionCFrame * SpreadDirection * SpreadAngle).LookVector
-				self:FireRay(nil, Direction)	
-			end
-
-			-- Crosshair bloom is configuration-driven and changes depending on whether the player is aiming.
-			local BloomStrength
-			if General.Aiming then
-				BloomStrength = Configuration.AimSpreadStrength
-			else
-				BloomStrength = Configuration.HipfireSpreadStrength
-			end
-
-			if CrosshairModule then
-				CrosshairModule.CrosshairDistance(BloomStrength)
-			end
-
-			General.PlayAnimationSet(self.Tracks, "Inspect", false)
-
-			if General.Aiming then
-				General.PlayAnimationSet(self.Tracks, "Shoot", true)
-			else
-				General.PlayAnimationSet(self.Tracks, "HipFireShoot", true)
-			end			
-
-			ClientSound(Tool.Handle.Audios.Gunshot, true)	
-			Effects(Tool, Character, {"Sounds", nil, nil, nil, {Tool.Handle.Audios.Gunshot, true}})
-
-			ClientEffects(GunEffects, "Particles", {Tool, Configuration.BulletsPerShot})
-			Effects(Tool, Character, {"Particles", nil, {Tool, Configuration.BulletsPerShot}})
-
-			local ShakeTime = 0
-
-
-
-			-- Camera shake is updated during rendering so the visual impulse appears immediately.
-			-- Two sine waves use different frequencies to avoid perfectly uniform motion, then the offset
-			-- lerps back toward zero after the short recoil impulse finishes.
-
-			local function ShootShake()
-				ShakeTime += .01
-				if ShakeTime <= .04 then
-					local currentTime = tick()
-					local BobbleX = math.cos(currentTime * 30) * 0.4 --speed, distance
-					local BobbleY = math.abs(math.sin(currentTime * 4)) * 0.3
-					local Bobble
-					Bobble = Vector3.new(BobbleX, BobbleY - .15, 0)
-					General.ShootShakeOffset.Value = General.ShootShakeOffset.Value:lerp(Bobble, 0.1)
-				else						
-					General.ShootShakeOffset.Value = General.ShootShakeOffset.Value:lerp(Vector3.zero, 0.1)
-
-					if General.ShootShakeOffset.Value == Vector3.zero then
-						ShakeTime = 0
-						RunService:UnbindFromRenderStep("ShootShake")	
-					end					
-				end
-			end
-
-			ShakeTime = 0 
-			RunService:UnbindFromRenderStep("ShootShake")	
-			RunService:BindToRenderStep("ShootShake", 1, ShootShake) 
-
-			local HorizontalMin = Configuration.HorizontalMin
-			local HorizontalMax = Configuration.HorizontalMax
-			local Strength = Configuration.HorizontalStrength
-
-			local VerticalMin = Configuration.VerticalMin
-			local VerticalMax = Configuration.VerticalMax
-
-			local function BaseRecoil(Min, Max)
-				return math.random(Min * 10000, Max * 10000)/10000 
-			end
-
-			-- HorizontalStrength biases which side receives the recoil kick, while the recoil magnitude
-			-- itself is sampled from the weapon's configured horizontal and vertical ranges.
-			local Direction = math.random() > Strength and 1 or -1 --Negative is to the right	
-			local HorizontalRecoil = BaseRecoil(HorizontalMin, HorizontalMax) * Direction
-			local VerticalRecoil = BaseRecoil(VerticalMin, VerticalMax)
-
-			General.Recoil.Value = Vector3.new(HorizontalRecoil, VerticalRecoil, 0)
-
-			-- Snipers temporarily force the player out of aim after firing. Once the fire cooldown ends,
-			-- aim is restored automatically if the right mouse button is still being held.
-			if Configuration.ShootType == "Sniper" then
-				coroutine.wrap(function()
-					self.AimDebounce = true
-					self:Unaim()
-					task.wait(Configuration.ShootDebounce)
-					self.AimDebounce = false
-					if UIS:IsMouseButtonPressed(Enum.UserInputType.MouseButton2) and Tool then
-						self:Aim()
-					end
-				end)()
-			end
-
-			Gun.CurrentBullets -= 1
-		-- Empty magazines play the no-ammo sound and request a reload. Automatic weapons use a guard
-		-- so holding the trigger does not repeatedly restart the click sound every render step.
-		else
-			coroutine.wrap(function()
-
-				if not self.MadeClickSoundForNoAmmo or Configuration.ShootType ~= "Auto" then
-					self.MadeClickSoundForNoAmmo = true
-					ClientSound(Tool.Handle.Audios.NoAmmo, true)
-					Effects(Tool, Character, {"Sounds", nil, nil, nil, {Tool.Handle.Audios.NoAmmo, true}})	
-					self:Reload()
-					self.MadeClickSoundForNoAmmo = false
-				end
-			end)()		
-		end
-
-		if Configuration.ShootType ~= "Shotgun" then
-			task.wait(Configuration.ShootDebounce)
-		end		
-
-		self.ShootDebounce = false
-		General.Shooting = false			
-	end
-end
-
-
--- Reloads only when reserve ammo exists, the magazine is not full, the weapon is not already
--- reloading, and the character is alive. Ammo transfer happens after the reload animation ends.
-function ClientTemplate:Reload(ActionName, State)
-	if not ActionName or State.Name == "Begin" then
-
-
-		local Tool = self.Tool
-		local Configuration = require(Tool.GunStuff.Configuration)
-
-		if Gun.Ammo[Configuration.AmmoType] > 0 and Gun.CurrentBullets < Configuration.PerMag and not self.Reloading and General.IsAlive(self.Character.Humanoid) then
-
-			local ToAdd = Configuration.PerMag - Gun.CurrentBullets
-
-			if ToAdd > Gun.Ammo[Configuration.AmmoType] then
-				ToAdd = Gun.Ammo[Configuration.AmmoType]
-			end
-			if ToAdd > 0 then
-				self.Reloading = true
-
-
-				ClientSound(Tool.Handle.Audios.Reload, true)
-				Effects(Tool, self.Character, {"Sounds", nil, nil, nil, {Tool.Handle.Audios.Reload, true}})
-
-				General.PlayAnimationSet(self.Tracks, "Reload", true)
-
-				if General.Aiming then
-					self:Unaim()
-				end
-	
-				self.Tracks.ReloadTrack.Stopped:Wait()
-	
-				-- Unequipping cancels reloading by setting self.Reloading to false. Re-check the flag after
-				-- waiting for the animation so a cancelled reload cannot still grant ammunition.
-				if self.Reloading then
-					Gun.CurrentBullets += ToAdd
-					Gun.Ammo[Configuration.AmmoType] -= ToAdd
-
-					self.Reloading = false
-
-					if UIS:IsMouseButtonPressed(Enum.UserInputType.MouseButton2) then
-						self:Aim()
-					end
-
-				end
-			end
-		end
-	end
-end
-
-
--- Loads one animation for the character and, on the client, a matching track for the first-person
--- arm model. Returning both tracks lets the same animation-set helpers keep the two rigs synchronized.
-function ClientTemplate:GetTracks(AnimName)
-	local Tool = self.Tool
-	local Humanoid = self.Character.Humanoid
-	local Animations = Tool.GunStuff.Animations
-	local ArmModel = RunService:IsClient() and workspace:WaitForChild("ArmModel")	
-	local NormalTrack
-	local ArmModelTrack
-	
-	local Animation = Animations:FindFirstChild(AnimName)
-
-	if Animation and Animation.AnimationId ~= "" then
-		NormalTrack = Humanoid.Animator:LoadAnimation(Animation)
-		if ArmModel then
-			ArmModelTrack = ArmModel.Humanoid.Animator:LoadAnimation(Animation)
-		end
-	end
-
-	return NormalTrack, ArmModelTrack 
-end
-
-
--- Applies one animation priority to a collection of related character/viewmodel tracks.
-local function SetTrackPriority(Tracks, NewPriority)
-	for i, Track in pairs(Tracks) do
-		Track.Priority = NewPriority
-	end
-end
-
-
--- Creates and initializes all runtime state for one weapon instance. The same constructor supports
--- player weapons and NPC weapons; client-only objects are created only when a real camera is available.
-function Gun.Client(Tool, Character)
-	local Client = CopyClientTemplate(Tool, Character)
-	local Player = Client.Player
-	local Humanoid = Character.Humanoid
-
-	Client.MainFrame = nil
-
-	
-	
-	local Configuration = require(Tool.GunStuff:FindFirstChildWhichIsA("ModuleScript"))
-	
-	local Equipping = false
-	local Equipped = false
-	Client.Reloading = false
-	local PerMag = Configuration.PerMag
-	local GunAmmo = PerMag
-	Gun.CurrentBullets = GunAmmo
-
-	
-	-- NPC/server execution has no CurrentCamera, so a tiny invisible Part acts as a directional stand-in.
-	-- This keeps later shooting code consistent because both players and NPCs expose a CFrame source.
-	local Camera = RunService:IsClient() and workspace.CurrentCamera
-	if not Camera then
-		Camera = Instance.new("Part")
-		Camera.Size = Vector3.zero
-		Camera.Transparency = 1
-		Camera.Anchored = true
-		Camera.CanCollide = false
-		Camera.CanTouch = false
-		Camera.CanQuery = false
-		Camera.CFrame = Character.Head.CFrame
-		Camera.Name = "Camera"
-		Camera.Parent = Character
-	end
-	
-	Client.Camera = Camera
-
-	local ArmModel = RunService:IsClient() and workspace:WaitForChild("ArmModel")	
-
-	-- Preload both third-person character tracks and first-person arm-model tracks once when the weapon
-	-- client is created. Keeping them in one table allows shared animation helpers to address both rigs.
-	local Tracks = {}
-	Client.Tracks = Tracks
-	Tracks.EquipTrack, Tracks.ArmModelEquipTrack = Client:GetTracks("Equip")
-	Tracks.UnequipTrack, Tracks.ArmModelUnequipTrack = Client:GetTracks("Unequip")
-	Tracks.IdleTrack, Tracks.ArmModelIdleTrack = Client:GetTracks("Idle")
-	Tracks.AimTrack, Tracks.ArmModelAimTrack = Client:GetTracks("Aim")
-	Tracks.ShootTrack, Tracks.ArmModelShootTrack = Client:GetTracks("Shoot")
-	Tracks.ReloadTrack, Tracks.ArmModelReloadTrack = Client:GetTracks("Reload")
-	Tracks.HipFireShootTrack, Tracks.ArmModelHipFireShootTrack = Client:GetTracks("HipFireShoot")
-	Tracks.InspectTrack, Tracks.ArmModelInspectTrack = Client:GetTracks("Inspect")
-
-	Tracks.JumpTrack, Tracks.ArmModelJumpTrack = Client:GetTracks("Jump")
-	Tracks.SprintTrack, Tracks.ArmModelSprintTrack = Client:GetTracks("Sprint")
-
-	
-	if RunService:IsServer() then
-		Tracks.WalkTrack = General.LoadTrack(game.ReplicatedStorage.Animations.Walk, Humanoid)
-	end
-	
-	SetTrackPriority({Tracks.IdleTrack, Tracks.ArmModelIdleTrack}, Enum.AnimationPriority.Action)
-	SetTrackPriority({Tracks.EquipTrack, Tracks.ArmModelEquipTrack}, Enum.AnimationPriority.Action4)
-
-	
-
-	Client.AimDebounce = false
-	Client.ShootDebounce = false
-
-
-	local function AimState(_, State)
-		if State.Name == "Begin" then
-			Client:Aim()
-		elseif State.Name == "End" then
-			Client:Unaim()
-		end
-	end
-	
-	local function ReloadState(_, State)
-		if State.Name == "Begin" then 
-			Client:Reload()
-		end
-	end
-
-
-	local MadeClickSoundForNoAmmo = false	
-	
-	
-	local BurstDebounce = false
-	local ShotgunDebounce = false
-	
-	local AlignPosition
-	local MaxTorque = 5
-	
-	local OriginalShootDebounce = Configuration.ShootDebounce
-	local MinigunStart = .18
-
-	-- Miniguns receive a spinning barrel controller and start at a slower fire interval. Holding fire
-	-- gradually reduces ShootDebounce until the configured normal fire rate is reached.
-	if Configuration.ShootType == "Minigun" then
-		AlignPosition = game.ReplicatedStorage.AngularVelocity:Clone()
-		AlignPosition.Parent = Tool.Model.Barrel
-		
-		local Attachment = Instance.new("Attachment")
-		Attachment.Parent = Tool.Model.Barrel
-		
-		AlignPosition.Attachment0 = Attachment
-			
-		Configuration.ShootDebounce = MinigunStart		
-	end
-	
-	local Holding
-	local Add = .01
-	
-
-	-- Starts firing according to the configured weapon type:
-	-- automatic weapons repeatedly call Fire while held; burst weapons fire three rounds;
-	-- shotguns use a dedicated debounce; and ordinary weapons fire once per press.
-	local function StartHold()
-		Holding = true
-
-		if Equipped then
-			if Configuration.ShootType == "Auto" then
-				MadeClickSoundForNoAmmo = false
-				RunService:UnbindFromRenderStep("Fire")	
-				RunService:BindToRenderStep("Fire", 0, function() Client:Fire() end)	
-
-				if Configuration.ShootType == "Minigun" then
-					AlignPosition.MaxTorque = MaxTorque
-
-					for i = 1, (Configuration.ShootDebounce - OriginalShootDebounce) * 100 do				
-						if not Holding then
-							break
-						end
-
-						Configuration.ShootDebounce -= Add
-						task.wait(.1)
-					end
-				end
-			elseif Configuration.ShootType == "Burst" then
-				if not BurstDebounce then
-					BurstDebounce = true
-					for i = 1, 3 do
-						Client:Fire()
-						task.wait(Configuration.ShootDebounce)
-					end
-					task.wait(Configuration.FiringDebounce)
-					BurstDebounce = false
-				end
-			elseif Configuration.ShootType == "Shotgun" then
-				if not ShotgunDebounce then
-					ShotgunDebounce = true
-					Client:Fire()
-					task.wait(Configuration.ShootDebounce)
-					ShotgunDebounce = false
-				end
-			else
-				Client:Fire()
-			end	
-		end
-	end
-	
-
-	-- Stops continuous fire and, for miniguns, removes barrel torque while gradually restoring the
-	-- slower startup fire interval. The loop exits early if the trigger is pressed again.
-	local function EndHold()
-		Holding = false
-		RunService:UnbindFromRenderStep("Fire")
-		if Configuration.ShootType == "Minigun" then
-			AlignPosition.MaxTorque = 0
-			
-			for i = 1, (MinigunStart - Configuration.ShootDebounce) * 100 do
-				if Holding then
-					break
-				end
-
-				Configuration.ShootDebounce += Add
-				task.wait(.1)
-			end	
-		end
-	end
-	
-
-	-- ContextActionService callback that maps input begin/end states to the trigger hold lifecycle.
-	local function ShootClick(_, State)
-		if State.Name == "Begin" then	
-			StartHold()
-		elseif State.Name == "End" then			
-			EndHold()
-		end
-	end	
-	
-	local Changing = false
-	local OldTarget
-
-	
-
-	-- Inspection is blocked while aiming so conflicting upper-body animations do not overlap.
-	local function Inspect(_, State)
-		if State.Name == "Begin" and not General.Aiming then
-			General.PlayAnimationSet(Tracks, "Inspect", true)
-		end
-	end
-
-
-
-	-- Equipping restores this weapon's stored magazine count, plays equip animations, then binds all
-	-- client input actions only after the equip animation completes and the weapon becomes active.
-	General.Equipped(Tool, function()
-		print("Equipped")
-		if ArmModel then
-			ArmModel:SetAttribute("Active", true)
-		end
-		
-		Gun.CurrentBullets = GunAmmo
-		
-
-		
-		
-		--if CustomCamera and General.ViewMode ~= "FirstPerson"then
-		--	CustomCamera.StartThirdPerson()	
-		--end
-		
-		ClientSound(Tool.Handle.Audios.Equip, true)
-
-		General.PlayAnimationSet(Tracks, "Idle", true, .01)
-		General.PlayAnimationSet(Tracks, "Equip", true, .01)
-		
-		
-		Equipping = true
-		Tracks.EquipTrack.Stopped:Wait()
-		
-		if not Equipping then return end
-		
-		Equipping = false
-		Equipped = true
-
-		if RunService:IsClient() then
-			CAS:BindAction("Inspect", Inspect, false, Enum.KeyCode.F)
-			CAS:BindAction("ShootClick", ShootClick, false, Enum.UserInputType.MouseButton1)
-			CAS:BindAction("AimState", AimState, false, Enum.UserInputType.MouseButton2)
-			CAS:BindAction("Reload", ReloadState, false, Enum.KeyCode.R)
-		end
-		
-		if UIS:IsMouseButtonPressed(Enum.UserInputType.MouseButton2) then
-			Client:Aim()
-		end
-
-		if UIS:IsMouseButtonPressed(Enum.UserInputType.MouseButton1) then
-			if Configuration.ShootType == "Auto" then
-				StartHold()
-			end
-		end	
+function Gun.Client(tool, character)
+	local client = createClient(tool, character)
+	client.Camera = getWeaponCamera(character)
+	client.ArmModel = IS_CLIENT and workspace:FindFirstChild("ArmModel") or nil
+	client.ShootShakeKey = "ShootShake_" .. tostring(client.Id) .. "_" .. tool.Name
+	client.Tracks = loadTracks(client)
+
+	setTrackPriority(
+		{client.Tracks.IdleTrack, client.Tracks.ArmModelIdleTrack},
+		Enum.AnimationPriority.Action
+	)
+	setTrackPriority(
+		{client.Tracks.EquipTrack, client.Tracks.ArmModelEquipTrack},
+		Enum.AnimationPriority.Action4
+	)
+
+	configureMinigun(client)
+
+	General.Equipped(tool, function()
+		client:OnEquipped()
 	end)
-	
 
-	-- Unequipping saves magazine state, cancels reload/aim/fire activity, stops animations, and unbinds
-	-- every input/render-step callback so the weapon cannot continue processing after it leaves the character.
-	General.Unequipped(Tool, function()
-		print("Unequipped")
-		if ArmModel then
-			ArmModel:SetAttribute("Active")
-		end
-		GunAmmo = Gun.CurrentBullets
-		Equipping = false
-		Equipped = false
-		--Player.PlayerGui.Sniper.Enabled = false
-		
-		ClientSound(Tool.Handle.Audios.Reload, false)
-		Effects(Tool, Character, {"Sounds", nil, nil, nil, nil, {Tool.Handle.Audios.Reload}})
-		
-		Client.Reloading = false
-		
-		for TrackName, Track in pairs(Tracks) do
-			General.PlayAnimation(Track, false, nil, TrackName)
-		end
-		
-		General.PlayAnimationSet(Tracks, "Unequip", true)
-
-		--Sound.Play(nil, false)
-		--Tool.GunStuff.Events.Other:FireServer("Sounds", nil, nil, nil, nil, nil, nil, nil, false)
-
-		General.Aiming = false	
-		Client:Unaim()
-		
-		CAS:UnbindAction("Inspect")
-		CAS:UnbindAction("ShootClick")
-		CAS:UnbindAction("AimState")
-		CAS:UnbindAction("Reload")
-		RunService:UnbindFromRenderStep("Fire")
-		
-		task.wait()
-		local NewTool = Character:FindFirstChildWhichIsA("Tool")
-
-		if not NewTool then
-			ClientSound(Tool.Handle.Audios.Unequip, true)
-	
-			--if CustomCamera and General.ViewMode == "ThirdPerson" then
-				--CustomCamera.EndThirdPerson()
-			--end
-		elseif Configuration.ShootType == "Sniper" and RunService:IsClient() then
-			Player.PlayerGui.Sniper.Enabled = false
-		end		
+	General.Unequipped(tool, function()
+		client:OnUnequipped()
 	end)
-	
-	return Client
+
+	return client
 end
-
-
 
 return Gun
