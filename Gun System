@@ -1,21 +1,5 @@
 Connected Discord-GitHub
 
---[[
-	Gun module
-
-	This module manages shared firearm behavior for player-controlled weapons and NPC weapons.
-	The public API is kept compatible with the previous version, while the implementation is
-	split into smaller helpers so each function has one clear responsibility.
-
-	The main design decisions are:
-	- Guard clauses reject invalid states early instead of wrapping the main path in deep nesting.
-	- Expensive or repeated lookups, such as the weapon configuration, are cached on each client.
-	- Raycast hit handling is split between character hits and world-surface hits.
-	- Bullet penetration carries a finite amount of strength and has a recursion limit so malformed
-	  geometry or unexpected material data cannot create an endless chain of recursive rays.
-	- Comments focus on reasoning and relationships between systems rather than narrating obvious lines.
-]]
-
 local ContextActionService = game:GetService("ContextActionService")
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -111,8 +95,6 @@ local function playClientSound(sound, shouldPlay)
 	sound:Stop()
 end
 
--- Visual effects need different routes depending on execution context. A client requests the
--- server to replicate shared effects, while the server can apply the same effect directly.
 local function dispatchEffect(tool, character, ...)
 	if IS_CLIENT then
 		tool.GunStuff.Events.Other:FireServer(...)
@@ -212,8 +194,6 @@ local function getWeaponCamera(character)
 		return workspace.CurrentCamera
 	end
 
-	-- NPCs and server-side weapons still need a CFrame that represents their aim direction.
-	-- A non-colliding proxy gives the existing API a camera-like object without client rendering.
 	return createFallbackCamera(character)
 end
 
@@ -1141,8 +1121,6 @@ function ClientTemplate:StartAutomaticLoop()
 	self.AutomaticLoopVersion += 1
 	local loopVersion = self.AutomaticLoopVersion
 
-	-- Automatic fire is a gameplay loop rather than rendering work, so it should not be bound to
-	-- RenderStep. The version token invalidates older loops if input is rebound or restarted quickly.
 	task.spawn(function()
 		while self.HoldingTrigger and self.Equipped and self.AutomaticLoopVersion == loopVersion do
 			self:Fire()
